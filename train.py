@@ -6,9 +6,49 @@ import pandas as pd
 from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from scipy.spatial import cKDTree  # Needed for the mock signal
+
 from models.vmdn import init_vmdn
 from models.galaxy_gnn import GraphBuilder
 
+
+# --- NEW HELPER FUNCTION ---
+def inject_mock_signal(pos, old_targets):
+    """
+    Overwrites targets so every galaxy points directly at its nearest neighbor.
+    This creates a perfect geometric correlation that the GNN must learn from positions.
+    """
+    print("!!! INJECTING MOCK SIGNAL: RADIAL ALIGNMENT !!!")
+    print("Targets will align to nearest neighbors. Inputs will be randomized.")
+
+    # 1. Find nearest neighbor for every point
+    # k=2 because the first result is always the point itself (dist=0)
+    tree = cKDTree(pos)
+    _, indices = tree.query(pos, k=2)
+
+    # indices[:, 0] is self, indices[:, 1] is the neighbor
+    neighbor_idx = indices[:, 1]
+
+    # 2. Calculate Vector to Neighbor
+    # Shape: [N, 2]
+    vec_to_neighbor = pos[neighbor_idx] - pos
+
+    # 3. Calculate Angle (radians)
+    # This is the "perfect" physical alignment signal
+    new_targets = np.arctan2(vec_to_neighbor[:, 1], vec_to_neighbor[:, 0])
+
+    # 4. Randomize Inputs
+    # We scramble the input shapes so the model CANNOT just pass the input
+    # through to the output. It MUST look at the neighbor's position.
+    random_angles = np.random.uniform(0, 2 * np.pi, size=len(pos))
+    new_e1 = np.cos(2 * random_angles)
+    new_e2 = np.sin(2 * random_angles)
+    new_inputs = np.stack([new_e1, new_e2], axis=1)
+
+    return new_inputs.astype(np.float32), new_targets.astype(np.float32)
+
+
+# ---------------------------
 
 def load_full_data(config):
     """Loads ALL data into GPU tensors and pre-computes the graph."""
@@ -26,8 +66,6 @@ def load_full_data(config):
 
     # 3. Create Features
     # Position: Normalize roughly so KNN makes sense
-    # (Simple option: subtract mean. For spherical, RA/Dec directly is okay for local,
-    # but projecting to cartesian is better. Keeping it simple for now as per previous code)
     pos = np.stack([ra, dec], axis=1)
     pos -= pos.mean(axis=0)
 
@@ -35,6 +73,11 @@ def load_full_data(config):
     e1 = np.cos(2 * phi_rad)
     e2 = np.sin(2 * phi_rad)
     shapes = np.stack([e1, e2], axis=1)
+
+    # --- SIGNAL INJECTION BLOCK ---
+    if config.get('inject_signal', False):
+        shapes, phi_rad = inject_mock_signal(pos, phi_rad)
+    # ------------------------------
 
     # 4. To Tensor (Move to GPU immediately)
     device = config['device']
@@ -63,7 +106,6 @@ def train(config):
 
     train_idx = indices[:n_train]
     val_idx = indices[n_train:n_train + n_val]
-    # Rest is test, unused in loop
 
     print(f"Train nodes: {len(train_idx)}, Val nodes: {len(val_idx)}")
 
@@ -83,22 +125,9 @@ def train(config):
         optimizer.zero_grad()
 
         # --- STOCHASTIC SUBSAMPLING ---
-        # 1. Forward pass on EVERYTHING (Propagation sees full context)
-        # Note: We pass the FULL edge_index.
-        # 2. Masking: Select random subset of TRAIN nodes for loss
-
-        # Generate mask for this step:
-        # Take the fixed train_idx, shuffle it, take top 25% (or config ratio)
         batch_size = int(len(train_idx) * config.get('subsample_ratio', 0.25))
         step_indices = train_idx[torch.randperm(len(train_idx))[:batch_size]]
 
-        # Create boolean mask for loss function (optional, but clean)
-        # Or just slice the inputs? No, we must forward full inputs.
-        # We slice the targets and the output.
-
-        # VMDN.loss internally calls forward(all), then computes log_prob(all), then slices.
-        # To save memory, we can slice `log_prob` inside loss.
-        # Let's pass a boolean mask of size [N] to the loss function.
         step_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
         step_mask[step_indices] = True
 
@@ -108,7 +137,6 @@ def train(config):
         optimizer.step()
 
         # --- VALIDATION ---
-        # Evaluate on ALL validation nodes (no subsampling)
         if epoch % 5 == 0:
             model.eval()
             with torch.no_grad():
@@ -141,8 +169,11 @@ if __name__ == "__main__":
         "patience": 20,
         "num_neighbors": 20,
         "hidden_dim": 64,
-        "subsample_ratio": 0.25,  # <--- The stochasticity param
+        "subsample_ratio": 0.25,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "log_dir": "runs/full_batch_run"
+        "log_dir": "runs/mock_signal_experiment",  # Changed log dir
+
+        # --- ENABLE SIGNAL INJECTION HERE ---
+        "inject_signal": True
     }
     train(conf)
