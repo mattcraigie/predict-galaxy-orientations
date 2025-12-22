@@ -13,7 +13,7 @@ from tqdm import tqdm
 from dataset import GalaxyDataset
 from models.vmdn import init_vmdn
 
-
+# Default fallback config
 DEFAULT_CONFIG = {
     "csv_path": "data/des_metacal_angles_minimal.csv",
     "batch_size": 256,
@@ -22,7 +22,7 @@ DEFAULT_CONFIG = {
     "patience": 10,
     "num_workers": 4,
     "log_dir": "runs/galaxy_vmdn_experiment_1",
-    "num_neighbors": 5,
+    "num_neighbors": 20,  # Ensure this matches your dataset needs
     "hidden_dim": 64,
     "num_layers": 3,
     "vmdn_regularization": 0.1,
@@ -77,12 +77,14 @@ def train(config: dict) -> None:
         batch_size=config["batch_size"],
         shuffle=True,
         num_workers=config["num_workers"],
+        pin_memory=True if config["device"] == "cuda" else False
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=config["batch_size"],
         shuffle=False,
         num_workers=config["num_workers"],
+        pin_memory=True if config["device"] == "cuda" else False
     )
 
     print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
@@ -95,7 +97,7 @@ def train(config: dict) -> None:
     writer = SummaryWriter(config["log_dir"])
     stopper = EarlyStopper(patience=config["patience"])
 
-    print("Starting training...")
+    print(f"Starting training on {config['device']}...")
 
     for epoch in range(config["epochs"]):
         # --- TRAINING LOOP ---
@@ -104,16 +106,23 @@ def train(config: dict) -> None:
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config['epochs']}")
         for batch in pbar:
-            pos = batch["pos"].to(config["device"])
-            z = batch["redshift"].to(config["device"])
-            shapes = batch["input_shapes"].to(config["device"])
-            target = batch["target_phi"].to(config["device"])
+            pos = batch['pos'].to(config['device'], non_blocking=True)
+            z = batch['redshift'].to(config['device'], non_blocking=True)
+            shapes = batch['input_shapes'].to(config['device'], non_blocking=True)
+            target = batch['target_phi'].to(config['device'], non_blocking=True)
 
             optimizer.zero_grad()
 
-            # Forward pass is handled inside loss() usually,
-            # but we call loss() directly on the VMDN wrapper
+            # Safety check: Skip batches that slipped through with NaNs
+            # (Ideally dataset.py filters these, but this is a final safety net)
+            if torch.isnan(pos).any() or torch.isnan(shapes).any():
+                continue
+
             loss = model.loss(pos, z, shapes, target=target)
+
+            if torch.isnan(loss):
+                print("Loss is NaN! Stopping training immediately.")
+                return
 
             loss.backward()
             optimizer.step()
@@ -131,16 +140,18 @@ def train(config: dict) -> None:
 
         with torch.no_grad():
             for batch in val_loader:
-                pos = batch["pos"].to(config["device"])
-                z = batch["redshift"].to(config["device"])
-                shapes = batch["input_shapes"].to(config["device"])
-                target = batch["target_phi"].to(config["device"])
+                pos = batch["pos"].to(config["device"], non_blocking=True)
+                z = batch["redshift"].to(config["device"], non_blocking=True)
+                shapes = batch["input_shapes"].to(config["device"], non_blocking=True)
+                target = batch["target_phi"].to(config["device"], non_blocking=True)
 
                 loss = model.loss(pos, z, shapes, target=target)
                 val_losses.append(loss.item())
 
-                # Capture stats for Tensorboard
+                # Collect stats for Tensorboard histograms
                 mu, kappa = model(pos, z, shapes)
+
+                # We flatten here because we just want the distribution of all predictions
                 all_mus.append(mu.cpu().numpy().flatten())
                 all_kappas.append(kappa.cpu().numpy().flatten())
 
@@ -152,11 +163,11 @@ def train(config: dict) -> None:
         writer.add_scalar('Loss/Train', avg_train_loss, epoch)
         writer.add_scalar('Loss/Val', avg_val_loss, epoch)
 
-        # Log distribution of predictions to ensure we aren't collapsing
-        flat_mus = np.concatenate(all_mus)
-        flat_kappas = np.concatenate(all_kappas)
-        writer.add_histogram('Distribution/Predicted_Mu', flat_mus, epoch)
-        writer.add_histogram('Distribution/Predicted_Kappa', flat_kappas, epoch)
+        if len(all_mus) > 0:
+            flat_mus = np.concatenate(all_mus)
+            flat_kappas = np.concatenate(all_kappas)
+            writer.add_histogram('Distribution/Predicted_Mu', flat_mus, epoch)
+            writer.add_histogram('Distribution/Predicted_Kappa', flat_kappas, epoch)
 
         # --- EARLY STOPPING ---
         if stopper.early_stop(avg_val_loss):
@@ -165,7 +176,8 @@ def train(config: dict) -> None:
 
         # Save best model
         if avg_val_loss == stopper.min_validation_loss:
-            torch.save(model.state_dict(), os.path.join(config["log_dir"], "best_model.pth"))
+            save_path = os.path.join(config["log_dir"], "best_model.pth")
+            torch.save(model.state_dict(), save_path)
 
     print("Training complete.")
     writer.close()
