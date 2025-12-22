@@ -35,7 +35,7 @@ def inject_mock_signal(pos, old_targets):
 
     # 3. Calculate Angle (radians)
     # This is the "perfect" physical alignment signal
-    new_targets = np.arctan2(vec_to_neighbor[:, 1], vec_to_neighbor[:, 0])
+    new_targets = np.arctan2(vec_to_neighbor[:, 1], vec_to_neighbor[:, 0]) * 0 + 1
 
     # 4. Randomize Inputs
     # We scramble the input shapes so the model CANNOT just pass the input
