@@ -1,191 +1,148 @@
 import argparse
-import os
-from pathlib import Path
-
-import numpy as np
-import torch
-import torch.optim as optim
 import yaml
-from torch.utils.data import DataLoader
+import torch
+import numpy as np
+import pandas as pd
+from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-
-from dataset import GalaxyDataset
 from models.vmdn import init_vmdn
-
-# Default fallback config
-DEFAULT_CONFIG = {
-    "csv_path": "data/des_metacal_angles_minimal.csv",
-    "batch_size": 256,
-    "lr": 1e-3,
-    "epochs": 100,
-    "patience": 10,
-    "num_workers": 4,
-    "log_dir": "runs/galaxy_vmdn_experiment_1",
-    "num_neighbors": 20,  # Ensure this matches your dataset needs
-    "hidden_dim": 64,
-    "num_layers": 3,
-    "vmdn_regularization": 0.1,
-    "device": "auto",
-}
+from models.galaxy_gnn import GraphBuilder
 
 
-class EarlyStopper:
-    def __init__(self, patience=5, min_delta=0):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.min_validation_loss = float('inf')
+def load_full_data(config):
+    """Loads ALL data into GPU tensors and pre-computes the graph."""
+    print(f"Loading full catalog from {config['csv_path']}...")
+    df = pd.read_csv(config['csv_path'])
 
-    def early_stop(self, validation_loss):
-        if validation_loss < self.min_validation_loss:
-            self.min_validation_loss = validation_loss
-            self.counter = 0
-        elif validation_loss > (self.min_validation_loss + self.min_delta):
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        return False
+    # 1. Clean
+    df = df.dropna(subset=['ra', 'dec', 'mean_z', 'phi_deg'])
+
+    # 2. Convert to Numpy
+    ra = df['ra'].values.astype(np.float32)
+    dec = df['dec'].values.astype(np.float32)
+    z = df['mean_z'].values.astype(np.float32)
+    phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
+
+    # 3. Create Features
+    # Position: Normalize roughly so KNN makes sense
+    # (Simple option: subtract mean. For spherical, RA/Dec directly is okay for local,
+    # but projecting to cartesian is better. Keeping it simple for now as per previous code)
+    pos = np.stack([ra, dec], axis=1)
+    pos -= pos.mean(axis=0)
+
+    # Shape inputs (Spin-2)
+    e1 = np.cos(2 * phi_rad)
+    e2 = np.sin(2 * phi_rad)
+    shapes = np.stack([e1, e2], axis=1)
+
+    # 4. To Tensor (Move to GPU immediately)
+    device = config['device']
+    t_pos = torch.tensor(pos, device=device)
+    t_z = torch.tensor(z[:, None], device=device)
+    t_shapes = torch.tensor(shapes, device=device)
+    t_target = torch.tensor(phi_rad, device=device)
+
+    # 5. Pre-compute Graph (Static)
+    print(f"Building static graph for {len(df)} galaxies (k={config['num_neighbors']})...")
+    edge_index = GraphBuilder.build_edges(t_pos, k=config['num_neighbors'])
+    print(f"Graph built with {edge_index.shape[1]} edges.")
+
+    return t_pos, t_z, t_shapes, t_target, edge_index
 
 
-def load_config(config_path: Path) -> dict:
-    with config_path.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle) or {}
+def train(config):
+    # 1. Load Everything
+    pos, z, shapes, target, edge_index = load_full_data(config)
+    N = pos.shape[0]
 
-    merged = {**DEFAULT_CONFIG, **config}
+    # 2. Split (Indices)
+    indices = torch.randperm(N)
+    n_train = int(N * 0.8)
+    n_val = int(N * 0.1)
 
-    if merged["device"] == "auto":
-        merged["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:n_train + n_val]
+    # Rest is test, unused in loop
 
-    repo_root = Path(__file__).resolve().parent
-    for path_key in ("csv_path", "log_dir"):
-        path_value = Path(merged[path_key])
-        if not path_value.is_absolute():
-            merged[path_key] = str((repo_root / path_value).resolve())
+    print(f"Train nodes: {len(train_idx)}, Val nodes: {len(val_idx)}")
 
-    return merged
+    # 3. Model
+    model = init_vmdn(config).to(config['device'])
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
+    writer = SummaryWriter(config['log_dir'])
 
+    best_loss = float('inf')
+    patience = config['patience']
+    patience_counter = 0
 
-def train(config: dict) -> None:
-    # 1. Setup Data
-    print(f"Loading dataset from {config['csv_path']}...")
-    train_ds = GalaxyDataset(config["csv_path"], num_neighbors=config["num_neighbors"], mode="train")
-    val_ds = GalaxyDataset(config["csv_path"], num_neighbors=config["num_neighbors"], mode="val")
+    print("Starting Full-Batch Training...")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        num_workers=config["num_workers"],
-        pin_memory=True if config["device"] == "cuda" else False
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config["batch_size"],
-        shuffle=False,
-        num_workers=config["num_workers"],
-        pin_memory=True if config["device"] == "cuda" else False
-    )
-
-    print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
-
-    # 2. Setup Model
-    model = init_vmdn(config).to(config["device"])
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
-
-    # 3. Logging & Checkpointing
-    writer = SummaryWriter(config["log_dir"])
-    stopper = EarlyStopper(patience=config["patience"])
-
-    print(f"Starting training on {config['device']}...")
-
-    for epoch in range(config["epochs"]):
-        # --- TRAINING LOOP ---
+    for epoch in range(config['epochs']):
         model.train()
-        train_losses = []
+        optimizer.zero_grad()
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config['epochs']}")
-        for batch in pbar:
-            pos = batch['pos'].to(config['device'], non_blocking=True)
-            z = batch['redshift'].to(config['device'], non_blocking=True)
-            shapes = batch['input_shapes'].to(config['device'], non_blocking=True)
-            target = batch['target_phi'].to(config['device'], non_blocking=True)
+        # --- STOCHASTIC SUBSAMPLING ---
+        # 1. Forward pass on EVERYTHING (Propagation sees full context)
+        # Note: We pass the FULL edge_index.
+        # 2. Masking: Select random subset of TRAIN nodes for loss
 
-            optimizer.zero_grad()
+        # Generate mask for this step:
+        # Take the fixed train_idx, shuffle it, take top 25% (or config ratio)
+        batch_size = int(len(train_idx) * config.get('subsample_ratio', 0.25))
+        step_indices = train_idx[torch.randperm(len(train_idx))[:batch_size]]
 
-            # Safety check: Skip batches that slipped through with NaNs
-            # (Ideally dataset.py filters these, but this is a final safety net)
-            if torch.isnan(pos).any() or torch.isnan(shapes).any():
-                continue
+        # Create boolean mask for loss function (optional, but clean)
+        # Or just slice the inputs? No, we must forward full inputs.
+        # We slice the targets and the output.
 
-            loss = model.loss(pos, z, shapes, target=target)
+        # VMDN.loss internally calls forward(all), then computes log_prob(all), then slices.
+        # To save memory, we can slice `log_prob` inside loss.
+        # Let's pass a boolean mask of size [N] to the loss function.
+        step_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
+        step_mask[step_indices] = True
 
-            if torch.isnan(loss):
-                print("Loss is NaN! Stopping training immediately.")
-                return
+        loss = model.loss(pos, z, shapes, target, edge_index=edge_index, mask=step_mask)
 
-            loss.backward()
-            optimizer.step()
+        loss.backward()
+        optimizer.step()
 
-            train_losses.append(loss.item())
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+        # --- VALIDATION ---
+        # Evaluate on ALL validation nodes (no subsampling)
+        if epoch % 5 == 0:
+            model.eval()
+            with torch.no_grad():
+                val_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
+                val_mask[val_idx] = True
 
-        avg_train_loss = np.mean(train_losses)
+                val_loss = model.loss(pos, z, shapes, target, edge_index=edge_index, mask=val_mask)
 
-        # --- VALIDATION LOOP ---
-        model.eval()
-        val_losses = []
-        all_mus = []
-        all_kappas = []
+                print(f"Epoch {epoch}: Train Loss {loss.item():.4f} | Val Loss {val_loss.item():.4f}")
+                writer.add_scalar('Loss/Train', loss.item(), epoch)
+                writer.add_scalar('Loss/Val', val_loss.item(), epoch)
 
-        with torch.no_grad():
-            for batch in val_loader:
-                pos = batch["pos"].to(config["device"], non_blocking=True)
-                z = batch["redshift"].to(config["device"], non_blocking=True)
-                shapes = batch["input_shapes"].to(config["device"], non_blocking=True)
-                target = batch["target_phi"].to(config["device"], non_blocking=True)
-
-                loss = model.loss(pos, z, shapes, target=target)
-                val_losses.append(loss.item())
-
-                # Collect stats for Tensorboard histograms
-                mu, kappa = model(pos, z, shapes)
-
-                # We flatten here because we just want the distribution of all predictions
-                all_mus.append(mu.cpu().numpy().flatten())
-                all_kappas.append(kappa.cpu().numpy().flatten())
-
-        avg_val_loss = np.mean(val_losses)
-
-        # --- LOGGING ---
-        print(f"Epoch {epoch + 1}: Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-
-        writer.add_scalar('Loss/Train', avg_train_loss, epoch)
-        writer.add_scalar('Loss/Val', avg_val_loss, epoch)
-
-        if len(all_mus) > 0:
-            flat_mus = np.concatenate(all_mus)
-            flat_kappas = np.concatenate(all_kappas)
-            writer.add_histogram('Distribution/Predicted_Mu', flat_mus, epoch)
-            writer.add_histogram('Distribution/Predicted_Kappa', flat_kappas, epoch)
-
-        # --- EARLY STOPPING ---
-        if stopper.early_stop(avg_val_loss):
-            print("Early stopping triggered!")
-            break
-
-        # Save best model
-        if avg_val_loss == stopper.min_validation_loss:
-            save_path = os.path.join(config["log_dir"], "best_model.pth")
-            torch.save(model.state_dict(), save_path)
-
-    print("Training complete.")
-    writer.close()
+                # Early Stop Check
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience_counter = 0
+                    torch.save(model.state_dict(), f"{config['log_dir']}/best_model.pth")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print("Early stopping.")
+                        break
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train the galaxy orientation model.")
-    parser.add_argument("--config", type=Path, required=True, help="Path to a YAML config file.")
-    args = parser.parse_args()
-
-    train(load_config(args.config))
+    conf = {
+        "csv_path": "data/des_metacal_angles_minimal.csv",
+        "lr": 1e-3,
+        "epochs": 1000,
+        "patience": 20,
+        "num_neighbors": 20,
+        "hidden_dim": 64,
+        "subsample_ratio": 0.25,  # <--- The stochasticity param
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "log_dir": "runs/full_batch_run"
+    }
+    train(conf)
