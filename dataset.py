@@ -20,6 +20,7 @@ class GalaxyDataset(Dataset):
 
         # 1. Load Data
         df = pd.read_csv(csv_file)
+        df = df.dropna(subset=["ra", "dec", "mean_z", "phi_deg"]).reset_index(drop=True)
 
         # 2. Extract Columns
         # Converting RA/Dec to simple float32 arrays
