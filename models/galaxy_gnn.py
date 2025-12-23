@@ -10,23 +10,20 @@ class GraphBuilder:
 
     @staticmethod
     def build_edges(pos: torch.Tensor, mode: str = "knn", k: int = 20) -> torch.Tensor:
-        # Move to CPU for scipy
         device = pos.device
         pos_np = pos.detach().cpu().numpy()
 
-        # Squeeze batch dim if B=1 (Full Batch mode)
+        # Squeeze batch dim if B=1
         if pos.dim() == 3 and pos.shape[0] == 1:
             pos_np = pos_np[0]
 
         num_points = pos_np.shape[0]
 
         if mode == "knn":
-            # Safety: clamp k to N-1
             k_eff = min(k, num_points - 1)
             tree = cKDTree(pos_np)
             _, idx = tree.query(pos_np, k=k_eff + 1)
 
-            # Remove self-loops (index 0)
             src = idx[:, 1:].flatten()
             dst = np.repeat(np.arange(num_points), k_eff)
 
@@ -49,7 +46,6 @@ class SparseLocalFrameLayer(nn.Module):
         self.vector_dim = vector_dim
         self.spin_symmetry = spin_symmetry
 
-        # 2 scalars (src, dst) + 1 vector (rotated) + 3 geo feats (dist, cos, sin)
         input_dim = (2 * scalar_dim) + vector_dim + 3
 
         self.message_mlp = nn.Sequential(
@@ -80,11 +76,8 @@ class SparseLocalFrameLayer(nn.Module):
         rot_angle = (beta_j - alpha_i) * self.spin_symmetry
 
         c, s = torch.cos(rot_angle), torch.sin(rot_angle)
-        # 2x2 Rotation Matrix flattened logic
-        # v_rot = [x*c - y*s, x*s + y*c]
 
         v_j = h_v[src]
-        # Reshape to [Edges, n_vecs, 2]
         n_vecs = self.vector_dim // 2
         v_j = v_j.view(-1, n_vecs, 2)
 
@@ -124,23 +117,18 @@ class GalaxyLSSBackbone(nn.Module):
         ])
 
     def forward(self, pos, redshift, input_shapes, edge_index=None, k=20):
-        # Flatten input: [N, D] (since we are doing full batch, B=1 is implicit)
         if pos.dim() == 3: pos = pos.squeeze(0)
         if redshift.dim() == 3: redshift = redshift.squeeze(0)
         if input_shapes.dim() == 3: input_shapes = input_shapes.squeeze(0)
 
-        # 1. Build Graph if not provided
         if edge_index is None:
             edge_index = GraphBuilder.build_edges(pos, k=k)
 
-        # 2. Encode
         h_s = self.enc_s(redshift)
         h_v = self.enc_v(input_shapes)
 
-        # Orientation is 0 (Survey Frame)
         orientation = torch.zeros((pos.shape[0], 1), device=pos.device)
 
-        # 3. Propagate
         for layer in self.layers:
             h_s, h_v = layer(h_s, h_v, edge_index, pos, orientation)
 
@@ -148,11 +136,33 @@ class GalaxyLSSBackbone(nn.Module):
 
 
 class GalaxyLSSWrapper(nn.Module):
-    def __init__(self, backbone):
+    """
+    Acts as the 'CompressionNetwork'.
+    Converts equivariant vector features into angles before passing to VMDN.
+    """
+
+    def __init__(self, backbone: GalaxyLSSBackbone):
         super().__init__()
         self.backbone = backbone
-        self.out_size = backbone.s_dim + backbone.v_dim
+
+        # Output size: Scalar Channels + (Vector Channels / 2)
+        # We divide vector channels by 2 because (x, y) pairs become 1 angle.
+        self.out_size = backbone.s_dim + (backbone.v_dim // 2)
 
     def forward(self, pos, redshift, input_shapes, edge_index=None):
         h_s, h_v = self.backbone(pos, redshift, input_shapes, edge_index)
-        return torch.cat([h_s, h_v], dim=-1)
+
+        # 1. Reshape Vector Features to Pairs
+        # h_v shape: [N, v_dim] -> [N, num_vectors, 2]
+        num_vectors = self.backbone.v_dim // 2
+        v_vectors = h_v.view(-1, num_vectors, 2)
+
+        # 2. Convert to Angles (Logic from your CompressionNetwork)
+        # arctan2(y, x) -> recovers the spin-2 angle
+        v_angles = torch.atan2(v_vectors[:, :, 1], v_vectors[:, :, 0] + 1e-5)
+
+        # 3. Fuse with Scalars
+        # We keep the scalars (redshift info) and concatenate the angles
+        features = torch.cat([h_s, v_angles], dim=-1)
+
+        return features
