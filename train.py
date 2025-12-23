@@ -54,21 +54,80 @@ def circular_mae(true, pred):
     return dist.mean().item()
 
 
-def create_density_figure(true, pred, title):
+def create_density_figure(true, pred, title, normalizer=None):
+
     true = np.remainder(true, 2 * np.pi)
     pred = np.remainder(pred, 2 * np.pi)
+
+    # ... (histogram logic same as before) ...
     bins = 64
     H, _, _ = np.histogram2d(true, pred, bins=bins, range=[[0, 2 * np.pi], [0, 2 * np.pi]])
     row_sums = H.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1.0
     H_norm = H / row_sums
+
     fig, ax = plt.subplots(figsize=(6, 6))
     im = ax.imshow(H_norm.T, origin='lower', extent=[0, 2 * np.pi, 0, 2 * np.pi], aspect='auto', cmap='viridis', vmin=0,
                    vmax=np.max(H_norm) * 0.8)
-    ax.set_title(title)
+
+    # Update Label based on whether we are normalized
+    label_suffix = " (Warped)" if normalizer else ""
+    ax.set_title(title + label_suffix)
+    ax.set_xlabel(f'True Angle{label_suffix}')
+    ax.set_ylabel(f'Pred Angle{label_suffix}')
+
     ax.plot([0, 2 * np.pi], [0, 2 * np.pi], 'r--', alpha=0.5)
     plt.colorbar(im, ax=ax)
     return fig
+
+
+# --- NEW: GLOBAL DISTRIBUTION REMOVAL ---
+class CDFNormalizer:
+    """
+    Learns the global distribution P(phi) and warps the space
+    so that the global distribution becomes Uniform(0, 2pi).
+
+    This forces the model to learn purely LOCAL deviations (intrinsic alignment)
+    rather than global systematics (grid locking).
+    """
+
+    def __init__(self):
+        self.cdf_func = None
+        self.inv_cdf_func = None
+
+    def fit(self, angles):
+        """
+        Compute empirical CDF from training data.
+        angles: numpy array of angles in [0, 2pi]
+        """
+        # Sort data to get the empirical distribution
+        sorted_angles = np.sort(angles)
+        n = len(sorted_angles)
+
+        # y-values for CDF (0 to 1)
+        y_vals = np.arange(n) / (n - 1)
+
+        # Create interpolation function F(x) -> u
+        # We pad with 0 and 2pi to handle edge cases
+        x_pad = np.concatenate([[0.0], sorted_angles, [2 * np.pi]])
+        y_pad = np.concatenate([[0.0], y_vals, [1.0]])
+
+        self.cdf_func = interp1d(x_pad, y_pad, kind='linear', bounds_error=False, fill_value=(0, 1))
+
+        # Inverse for plotting later (optional)
+        self.inv_cdf_func = interp1d(y_pad, x_pad, kind='linear', bounds_error=False, fill_value="extrapolate")
+        print(" Global CDF fitted. Systematic biases capture initiated.")
+
+    def transform(self, angles):
+        """ Warps angles to be Uniform [0, 2pi] """
+        if self.cdf_func is None:
+            raise ValueError("Run fit() first!")
+
+        # 1. Map to [0, 1] using CDF
+        u = self.cdf_func(angles)
+
+        # 2. Map to [0, 2pi]
+        return (u * 2 * np.pi).astype(np.float32)
 
 
 # --- SIGNAL INJECTION (FOR DEBUGGING) ---
@@ -88,30 +147,37 @@ def load_full_data(config):
     df = pd.read_csv(config['csv_path'])
     df = df.dropna(subset=['ra', 'dec', 'mean_z', 'phi_deg'])
 
-    # 1. Remove Duplicates (Crucial for Leak Prevention)
+    # 1. Remove Duplicates
     df['ra_round'] = df['ra'].round(5)
     df['dec_round'] = df['dec'].round(5)
-    initial_len = len(df)
     df = df.drop_duplicates(subset=['ra_round', 'dec_round'])
-    print(f"Dropped {initial_len - len(df)} duplicate positions.")
 
     ra = df['ra'].values.astype(np.float32)
     dec = df['dec'].values.astype(np.float32)
     pos = np.stack([ra, dec], axis=1)
 
-    # Normalize positions roughly to [-1, 1] for signal injection math
     pos_min, pos_max = pos.min(axis=0), pos.max(axis=0)
     pos = (pos - pos_min) / (pos_max - pos_min) * 2 - 1
 
     z = df['mean_z'].values.astype(np.float32)
 
+    # 2. Process Targets
     if config.get('inject_signal', False):
         shapes, target_angles = inject_smooth_signal(pos)
+        # Note: We usually DON'T normalize injected signals because they are already smooth/known
+        # But if you want to test the normalizer, you can fit it here too.
+        normalizer = None
     else:
-        # Real Data (Target = 2*phi)
+        # Real Data
         phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
-        target_angles = 2.0 * phi_rad
-        e1, e2 = np.cos(target_angles), np.sin(target_angles)
+        raw_targets = 2.0 * phi_rad
+
+        # --- APPLY CDF NORMALIZATION ---
+        normalizer = CDFNormalizer()
+        normalizer.fit(raw_targets)  # Learn the "Grid Locking" or other biases
+        target_angles = normalizer.transform(raw_targets)  # Warp to Uniform
+        e1 = np.cos(target_angles)
+        e2 = np.sin(target_angles)
         shapes = np.stack([e1, e2], axis=1)
 
     device = config['device']
@@ -120,7 +186,8 @@ def load_full_data(config):
         torch.tensor(z[:, None], device=device),
         torch.tensor(shapes, device=device),
         torch.tensor(target_angles, device=device),
-        GraphBuilder.build_edges(torch.tensor(pos, device=device), k=config['num_neighbors'])
+        GraphBuilder.build_edges(torch.tensor(pos, device=device), k=config['num_neighbors']),
+        normalizer  # Return this so we can plot correctly later
     )
 
 
@@ -157,7 +224,8 @@ def generate_full_catalog_predictions(model, pos, z, shapes, edge_index, num_pas
 
 # --- MAIN LOOP ---
 def train(config: dict) -> None:
-    pos, z, shapes, target, edge_index = load_full_data(config)
+    # Capture the normalizer in the return tuple
+    pos, z, shapes, target, edge_index, normalizer = load_full_data(config)
     N = pos.shape[0]
 
     # Splits
@@ -253,7 +321,8 @@ def train(config: dict) -> None:
         writer.add_scalar(f'Improvement/{name}', improvement, 0)
 
         # Generate Plot
-        fig = create_density_figure(subset_true.cpu().numpy(), subset_pred.cpu().numpy(), f"{name} Predictions")
+        fig = create_density_figure(subset_true.cpu().numpy(), subset_pred.cpu().numpy(), f"{name} Predictions",
+                                    normalizer)
         writer.add_figure(f"Density/{name}_Final", fig, 0)
 
     # Evaluate all splits
