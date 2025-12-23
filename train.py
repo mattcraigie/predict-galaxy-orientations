@@ -12,6 +12,7 @@ from scipy.interpolate import interp1d
 
 from models.vmdn import init_vmdn
 from models.galaxy_gnn import GraphBuilder
+from models.pretraining import GalaxyReconstructor
 
 # Default config
 DEFAULT_CONFIG = {
@@ -240,8 +241,63 @@ def generate_full_catalog_predictions(model, pos, z, shapes, edge_index, num_pas
     return all_mu, all_kappa
 
 
+def run_pretraining(config, pos, z, shapes, edge_index):
+    print("\n=== STARTING PRE-TRAINING (Structure Learning) ===")
+
+    # 1. Init Reconstructor Model
+    pre_model = GalaxyReconstructor(config).to(config['device'])
+    optimizer = torch.optim.Adam(pre_model.parameters(), lr=config['lr'])
+
+    # 2. Pre-training Loop
+    # Usually needs fewer epochs than main training
+    pretrain_epochs = config.get('pretrain_epochs', 50)
+
+    pre_model.train()
+    for epoch in range(pretrain_epochs):
+        optimizer.zero_grad()
+
+        # --- MASKING STRATEGY ---
+        # Mask a random subset of nodes (e.g., 25%)
+        N = pos.shape[0]
+        batch_size = int(N * 0.25)
+        mask_idx = torch.randperm(N)[:batch_size]
+
+        # Create Masked Inputs (Hide z AND shape)
+        masked_shapes = shapes.clone()
+        masked_z = z.clone()
+
+        masked_shapes[mask_idx] = 0.0
+        masked_z[mask_idx] = 0.0  # Or set to mean redshift
+
+        # Create Boolean Mask
+        mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
+        mask[mask_idx] = True
+
+        # --- FORWARD & LOSS ---
+        # Model tries to guess the true 'z' and 'shapes' of the masked nodes
+        loss = pre_model.loss(pos, masked_z, masked_shapes, edge_index, mask)
+
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 10 == 0:
+            print(f"  [Pretrain Epoch {epoch}] Reconstruction Loss: {loss.item():.6f}")
+
+    print("=== PRE-TRAINING COMPLETE ===\n")
+
+    # 3. Save Backbone Weights
+    torch.save(pre_model.backbone.state_dict(), "pretrained_backbone.pth")
+    return "pretrained_backbone.pth"
+
+
 # --- TRAIN LOOP ---
 def train(config: dict) -> None:
+    pos, z, shapes, target, edge_index, normalizer = load_full_data(config)
+
+    # --- STEP 1: PRE-TRAINING ---
+    if config.get('do_pretrain', True):
+        weights_path = run_pretraining(config, pos, z, shapes, edge_index)
+
     pos, z, shapes, target, edge_index, normalizer = load_full_data(config)
     N = pos.shape[0]
 
