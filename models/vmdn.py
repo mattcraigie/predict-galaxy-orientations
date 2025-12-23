@@ -54,7 +54,7 @@ class VMDN(nn.Module):
         if hidden_layers is None:
             hidden_layers = [32, 32]
 
-        self.angle_network = MLP(input_dim=compression_network.out_size, output_dim=1, hidden_layers=hidden_layers)
+        self.angle_network = MLP(input_dim=compression_network.out_size, output_dim=2, hidden_layers=hidden_layers)
         self.kappa_network = MLP(input_dim=compression_network.out_size, output_dim=1, hidden_layers=hidden_layers)
 
         self.dropout = dropout
@@ -62,7 +62,9 @@ class VMDN(nn.Module):
 
     def forward(self, *args):
         compressed = self.compression_network(*args)
-        mu = (self.angle_network(compressed) % (np.pi * 2))
+        mean_xy = self.angle_network(compressed)
+        mean_xy = mean_xy / (mean_xy.norm(dim=-1, keepdim=True) + 1e-8)
+        mu = torch.atan2(mean_xy[..., 1], mean_xy[..., 0])
 
         log_kappa = self.kappa_network(compressed)
         log_kappa = torch.clamp(log_kappa, min=-10, max=3)
@@ -75,8 +77,9 @@ class VMDN(nn.Module):
         # Flatten target to match the flattened mu/kappa
         target = target.view(-1)
 
+        phi_target = 2 * target
         dist_vonmises = VonMises(mu.squeeze(), kappa.squeeze())
-        log_prob = dist_vonmises.log_prob(target)
+        log_prob = dist_vonmises.log_prob(phi_target)
 
         if self.training:
             node_mask = torch.rand(log_prob.size(0), device=log_prob.device) > self.dropout

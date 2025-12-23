@@ -1,30 +1,32 @@
+import argparse
 import os
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.optim as optim
+import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import numpy as np
 from tqdm import tqdm
 
-# Import our custom modules
 from dataset import GalaxyDataset
-from vmdn import init_vmdn
+from models.vmdn import init_vmdn
 
-# --- Configuration ---
-CONFIG = {
-    "csv_path": "des_metacal_angles_minimal.csv",
+
+DEFAULT_CONFIG = {
+    "csv_path": "data/des_metacal_angles_minimal.csv",
     "batch_size": 256,
     "lr": 1e-3,
     "epochs": 100,
-    "patience": 10,  # Early stopping patience
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "patience": 10,
+    "num_workers": 4,
     "log_dir": "runs/galaxy_vmdn_experiment_1",
-
-    # Model Config
-    "num_neighbors": 5,  # Size of each GNN graph
+    "num_neighbors": 5,
     "hidden_dim": 64,
     "num_layers": 3,
-    "vmdn_regularization": 0.1,  # Lambda kappa
+    "vmdn_regularization": 0.1,
+    "device": "auto",
 }
 
 
@@ -46,38 +48,66 @@ class EarlyStopper:
         return False
 
 
-def train():
-    # 1. Setup Data
-    print(f"Loading dataset from {CONFIG['csv_path']}...")
-    train_ds = GalaxyDataset(CONFIG['csv_path'], num_neighbors=CONFIG['num_neighbors'], mode='train')
-    val_ds = GalaxyDataset(CONFIG['csv_path'], num_neighbors=CONFIG['num_neighbors'], mode='val')
+def load_config(config_path: Path) -> dict:
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
 
-    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=4)
+    merged = {**DEFAULT_CONFIG, **config}
+
+    if merged["device"] == "auto":
+        merged["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+
+    repo_root = Path(__file__).resolve().parent
+    for path_key in ("csv_path", "log_dir"):
+        path_value = Path(merged[path_key])
+        if not path_value.is_absolute():
+            merged[path_key] = str((repo_root / path_value).resolve())
+
+    return merged
+
+
+def train(config: dict) -> None:
+    # 1. Setup Data
+    print(f"Loading dataset from {config['csv_path']}...")
+    train_ds = GalaxyDataset(config["csv_path"], num_neighbors=config["num_neighbors"], mode="train")
+    val_ds = GalaxyDataset(config["csv_path"], num_neighbors=config["num_neighbors"], mode="val")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        num_workers=config["num_workers"],
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+    )
 
     print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
 
     # 2. Setup Model
-    model = init_vmdn(CONFIG).to(CONFIG['device'])
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'])
+    model = init_vmdn(config).to(config["device"])
+    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
 
     # 3. Logging & Checkpointing
-    writer = SummaryWriter(CONFIG['log_dir'])
-    stopper = EarlyStopper(patience=CONFIG['patience'])
+    writer = SummaryWriter(config["log_dir"])
+    stopper = EarlyStopper(patience=config["patience"])
 
     print("Starting training...")
 
-    for epoch in range(CONFIG['epochs']):
+    for epoch in range(config["epochs"]):
         # --- TRAINING LOOP ---
         model.train()
         train_losses = []
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{CONFIG['epochs']}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config['epochs']}")
         for batch in pbar:
-            pos = batch['pos'].to(CONFIG['device'])
-            z = batch['redshift'].to(CONFIG['device'])
-            shapes = batch['input_shapes'].to(CONFIG['device'])
-            target = batch['target_phi'].to(CONFIG['device'])
+            pos = batch["pos"].to(config["device"])
+            z = batch["redshift"].to(config["device"])
+            shapes = batch["input_shapes"].to(config["device"])
+            target = batch["target_phi"].to(config["device"])
 
             optimizer.zero_grad()
 
@@ -101,10 +131,10 @@ def train():
 
         with torch.no_grad():
             for batch in val_loader:
-                pos = batch['pos'].to(CONFIG['device'])
-                z = batch['redshift'].to(CONFIG['device'])
-                shapes = batch['input_shapes'].to(CONFIG['device'])
-                target = batch['target_phi'].to(CONFIG['device'])
+                pos = batch["pos"].to(config["device"])
+                z = batch["redshift"].to(config["device"])
+                shapes = batch["input_shapes"].to(config["device"])
+                target = batch["target_phi"].to(config["device"])
 
                 loss = model.loss(pos, z, shapes, target=target)
                 val_losses.append(loss.item())
@@ -135,11 +165,20 @@ def train():
 
         # Save best model
         if avg_val_loss == stopper.min_validation_loss:
-            torch.save(model.state_dict(), os.path.join(CONFIG['log_dir'], "best_model.pth"))
+            torch.save(model.state_dict(), os.path.join(config["log_dir"], "best_model.pth"))
 
     print("Training complete.")
     writer.close()
 
 
 if __name__ == "__main__":
-    train()
+    parser = argparse.ArgumentParser(description="Train the galaxy orientation model.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/default.yaml"),
+        help="Path to a YAML config file.",
+    )
+    args = parser.parse_args()
+
+    train(load_config(args.config))
