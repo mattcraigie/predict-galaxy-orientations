@@ -20,11 +20,11 @@ DEFAULT_CONFIG = {
     "patience": 30,
     "num_neighbors": 20,
     "hidden_dim": 64,
-    "subsample_ratio": 0.25,
+    "subsample_ratio": 0.25,  # Fraction of nodes to train on per step
     "device": "auto",
     "log_dir": "runs",
-    "run_name": "galaxy_gnn",
-    "inject_signal": False
+    "run_name": "galaxy_gnn_real",
+    "inject_signal": False  # Set to True to test with synthetic swirl
 }
 
 
@@ -42,7 +42,18 @@ def load_config(config_path: Path) -> dict:
     return merged
 
 
-# --- PLOTTING ---
+# --- METRICS & PLOTTING ---
+def circular_mae(true, pred):
+    """
+    Computes Mean Absolute Error for angular data in [0, 2pi].
+    Handles wrapping: distance between 0.1 and 6.2 is small (0.18), not large.
+    """
+    diff = torch.abs(true - pred)
+    # The shortest distance on a circle is min(diff, 2pi - diff)
+    dist = torch.min(diff, 2 * np.pi - diff)
+    return dist.mean().item()
+
+
 def create_density_figure(true, pred, title):
     true = np.remainder(true, 2 * np.pi)
     pred = np.remainder(pred, 2 * np.pi)
@@ -60,83 +71,104 @@ def create_density_figure(true, pred, title):
     return fig
 
 
-# --- SIGNAL INJECTION FIX ---
+# --- SIGNAL INJECTION (FOR DEBUGGING) ---
 def inject_smooth_signal(pos):
-    """
-    Creates a signal where orientation depends on POSITION.
-    This ensures neighbors have similar orientations, making
-    the task solvable even when the target node is masked.
-    """
+    """Creates a giant spatial swirl for testing."""
     print("!!! INJECTING SIGNAL: SMOOTH SPATIAL FIELD !!!")
-
-    # Example: A giant swirl/vortex based on coordinates
-    # Angle = arctan2(y, x) + distance
-    # This is smooth, so A is similar to B.
-    x = pos[:, 0]
-    y = pos[:, 1]
-
-    # Target is 2*phi domain [0, 2pi]
-    # We use a frequency multiplier to make it vary across the sky
-    freq = 10.0
+    x, y = pos[:, 0], pos[:, 1]
+    freq = 5.0
     target_angles = np.remainder(np.arctan2(y, x) * freq, 2 * np.pi).astype(np.float32)
-
-    # Inputs match the target field perfectly
-    e1 = np.cos(target_angles)
-    e2 = np.sin(target_angles)
-    new_inputs = np.stack([e1, e2], axis=1).astype(np.float32)
-
-    return new_inputs, target_angles
+    e1, e2 = np.cos(target_angles), np.sin(target_angles)
+    return np.stack([e1, e2], axis=1).astype(np.float32), target_angles
 
 
+# --- DATA LOADING ---
 def load_full_data(config):
     print(f"Loading full catalog from {config['csv_path']}...")
     df = pd.read_csv(config['csv_path'])
     df = df.dropna(subset=['ra', 'dec', 'mean_z', 'phi_deg'])
 
+    # 1. Remove Duplicates (Crucial for Leak Prevention)
+    df['ra_round'] = df['ra'].round(5)
+    df['dec_round'] = df['dec'].round(5)
+    initial_len = len(df)
+    df = df.drop_duplicates(subset=['ra_round', 'dec_round'])
+    print(f"Dropped {initial_len - len(df)} duplicate positions.")
+
     ra = df['ra'].values.astype(np.float32)
     dec = df['dec'].values.astype(np.float32)
     pos = np.stack([ra, dec], axis=1)
 
-    # Normalize positions to [-1, 1] range for the synthetic signal to look nice
+    # Normalize positions roughly to [-1, 1] for signal injection math
     pos_min, pos_max = pos.min(axis=0), pos.max(axis=0)
     pos = (pos - pos_min) / (pos_max - pos_min) * 2 - 1
 
     z = df['mean_z'].values.astype(np.float32)
 
-    # Logic Branch
     if config.get('inject_signal', False):
         shapes, target_angles = inject_smooth_signal(pos)
     else:
-        # Real Data
+        # Real Data (Target = 2*phi)
         phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
         target_angles = 2.0 * phi_rad
-        e1 = np.cos(target_angles)
-        e2 = np.sin(target_angles)
+        e1, e2 = np.cos(target_angles), np.sin(target_angles)
         shapes = np.stack([e1, e2], axis=1)
 
     device = config['device']
-    t_pos = torch.tensor(pos, device=device)
-    t_z = torch.tensor(z[:, None], device=device)
-    t_shapes = torch.tensor(shapes, device=device)
-    t_target = torch.tensor(target_angles, device=device)
-
-    print(f"Building graph (k={config['num_neighbors']})...")
-    edge_index = GraphBuilder.build_edges(t_pos, k=config['num_neighbors'])
-
-    return t_pos, t_z, t_shapes, t_target, edge_index
+    return (
+        torch.tensor(pos, device=device),
+        torch.tensor(z[:, None], device=device),
+        torch.tensor(shapes, device=device),
+        torch.tensor(target_angles, device=device),
+        GraphBuilder.build_edges(torch.tensor(pos, device=device), k=config['num_neighbors'])
+    )
 
 
+# --- DETERMINISTIC INFERENCE ---
+def generate_full_catalog_predictions(model, pos, z, shapes, edge_index, num_passes=4):
+    """
+    Predicts every galaxy by masking it in one of K passes.
+    Guarantees no leakage while using ~75% of neighbors for context.
+    """
+    print(f"\n--- Generating Full Catalog Predictions ({num_passes}-Pass Strategy) ---")
+    model.eval()
+    N = pos.shape[0]
+    all_mu = torch.zeros(N, device=pos.device)
+    all_kappa = torch.zeros(N, device=pos.device)
+
+    with torch.no_grad():
+        for i in range(num_passes):
+            # 1. Mask Indices: i, i+4, i+8...
+            mask_indices = torch.arange(i, N, num_passes, device=pos.device)
+
+            # 2. Prepare Masked Input (Zero out the targets for this pass)
+            masked_shapes = shapes.clone()
+            masked_shapes[mask_indices] = 0.0
+
+            # 3. Forward Pass (Predict everyone)
+            mu, kappa = model(pos, z, masked_shapes, edge_index)
+
+            # 4. Store ONLY the predictions for the masked nodes
+            all_mu[mask_indices] = mu[mask_indices].squeeze()
+            all_kappa[mask_indices] = kappa[mask_indices].squeeze()
+
+    return all_mu, all_kappa
+
+
+# --- MAIN LOOP ---
 def train(config: dict) -> None:
     pos, z, shapes, target, edge_index = load_full_data(config)
     N = pos.shape[0]
 
+    # Splits
     indices = torch.randperm(N)
     n_train = int(N * 0.8)
     n_val = int(N * 0.1)
     train_idx = indices[:n_train]
     val_idx = indices[n_train:n_train + n_val]
+    test_idx = indices[n_train + n_val:]
 
-    print(f"Train: {len(train_idx)}, Val: {len(val_idx)}")
+    print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_name = f"{config.get('run_name', 'run')}_{timestamp}"
@@ -148,22 +180,20 @@ def train(config: dict) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
 
     best_loss = float('inf')
-    patience_counter = 0
+    patience_cnt = 0
 
     print("Starting Training...")
     for epoch in range(config["epochs"]):
         model.train()
         optimizer.zero_grad()
 
-        # 1. Masking Strategy
+        # --- MASKED TRAINING STEP ---
         batch_size = int(len(train_idx) * config.get('subsample_ratio', 0.25))
         mask_idx = train_idx[torch.randperm(len(train_idx))[:batch_size]]
 
-        # Zero out inputs for the target nodes (Blind Spot)
         masked_shapes = shapes.clone()
         masked_shapes[mask_idx] = 0.0
 
-        # Loss calculated only on masked nodes
         step_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
         step_mask[mask_idx] = True
 
@@ -171,7 +201,7 @@ def train(config: dict) -> None:
         loss.backward()
         optimizer.step()
 
-        # 2. Validation
+        # --- VALIDATION ---
         if epoch % 5 == 0:
             model.eval()
             with torch.no_grad():
@@ -188,33 +218,51 @@ def train(config: dict) -> None:
 
                 if val_loss < best_loss:
                     best_loss = val_loss
-                    patience_counter = 0
+                    patience_cnt = 0
                     torch.save(model.state_dict(), log_dir / "best_model.pth")
                 else:
-                    patience_counter += 1
-                    if patience_counter >= config['patience']:
+                    patience_cnt += 1
+                    if patience_cnt >= config['patience']:
                         print("Early stopping.")
                         break
 
-        # 3. Plotting
-        if epoch % 20 == 0:
-            model.eval()
-            with torch.no_grad():
-                # For plotting, we blindly predict everything.
-                # To see true performance, we should mask the train set inputs.
-                plot_shapes = shapes.clone()
-                plot_shapes[train_idx] = 0.0
+    # --- FINAL EVALUATION ---
+    print("\nTraining Complete. Loading best model...")
+    model.load_state_dict(torch.load(log_dir / "best_model.pth"))
 
-                mu_all, _ = model(pos, z, plot_shapes, edge_index)
-                t_np = target.cpu().numpy().flatten()
-                m_np = mu_all.cpu().numpy().flatten()
+    # 1. Generate clean predictions for EVERYONE
+    pred_mu, pred_kappa = generate_full_catalog_predictions(model, pos, z, shapes, edge_index, num_passes=4)
 
-                sub = train_idx[:5000].cpu().numpy()
-                fig = create_density_figure(t_np[sub], m_np[sub], f"Train Density (Epoch {epoch})")
-                writer.add_figure("Density/Train", fig, epoch)
+    # 2. Compute Metrics
+    # Baseline Random Guess MAE = pi/2 approx 1.5708
+    baseline_mae = np.pi / 2
+
+    def evaluate_subset(name, idx_tensor):
+        subset_true = target[idx_tensor]
+        subset_pred = pred_mu[idx_tensor]
+
+        mae = circular_mae(subset_true, subset_pred)
+        improvement = (baseline_mae - mae) / baseline_mae * 100.0
+
+        print(f"--- {name} SET RESULTS ---")
+        print(f"  MAE (Model):   {mae:.4f} rad")
+        print(f"  MAE (Random):  {baseline_mae:.4f} rad")
+        print(f"  Improvement:   {improvement:.2f}%")
+
+        writer.add_scalar(f'MAE/{name}', mae, 0)
+        writer.add_scalar(f'Improvement/{name}', improvement, 0)
+
+        # Generate Plot
+        fig = create_density_figure(subset_true.cpu().numpy(), subset_pred.cpu().numpy(), f"{name} Predictions")
+        writer.add_figure(f"Density/{name}_Final", fig, 0)
+
+    # Evaluate all splits
+    evaluate_subset("Train", train_idx)
+    evaluate_subset("Validation", val_idx)
+    evaluate_subset("Test", test_idx)
 
     writer.close()
-    print("Training Complete.")
+    print(f"\nResults saved to {log_dir}")
 
 
 if __name__ == "__main__":
