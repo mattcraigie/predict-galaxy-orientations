@@ -9,6 +9,8 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from scipy.spatial import cKDTree
+from datetime import datetime
 
 from dataset import GalaxyDataset
 from models.vmdn import init_vmdn
@@ -109,25 +111,24 @@ def train(config: dict) -> None:
             shapes = batch["input_shapes"].to(config["device"])
             target = batch["target_phi"].to(config["device"])
 
-            optimizer.zero_grad()
 
-            # Forward pass is handled inside loss() usually,
-            # but we call loss() directly on the VMDN wrapper
-            loss = model.loss(pos, z, shapes, target=target)
+def inject_identity_signal(pos, N):
+    print("!!! INJECTING SIGNAL: IDENTITY MAPPING !!!")
+    # Generate random targets in 0-2pi (representing 2*phi)
+    new_targets = np.random.uniform(0, 2 * np.pi, size=N).astype(np.float32)
 
-            loss.backward()
-            optimizer.step()
+    # Input is cos/sin of this target
+    e1 = np.cos(new_targets)  # Note: new_targets is already 2*phi
+    e2 = np.sin(new_targets)
+    new_inputs = np.stack([e1, e2], axis=1).astype(np.float32)
 
-            train_losses.append(loss.item())
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+    return new_inputs, new_targets
 
-        avg_train_loss = np.mean(train_losses)
 
-        # --- VALIDATION LOOP ---
-        model.eval()
-        val_losses = []
-        all_mus = []
-        all_kappas = []
+def load_full_data(config):
+    print(f"Loading full catalog from {config['csv_path']}...")
+    df = pd.read_csv(config['csv_path'])
+    df = df.dropna(subset=['ra', 'dec', 'mean_z', 'phi_deg'])
 
         with torch.no_grad():
             for batch in val_loader:
@@ -136,38 +137,42 @@ def train(config: dict) -> None:
                 shapes = batch["input_shapes"].to(config["device"])
                 target = batch["target_phi"].to(config["device"])
 
-                loss = model.loss(pos, z, shapes, target=target)
-                val_losses.append(loss.item())
+    # --- CRITICAL FIX: USE DOUBLE ANGLES ---
+    # Galaxy shapes are Spin-2 (180 deg symmetry).
+    # VMDN models Spin-1 (360 deg symmetry).
+    # We must train on 2*phi so the topology matches.
+    phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
+    double_phi = 2.0 * phi_rad  # [0, 2pi]
+    # ---------------------------------------
 
-                # Capture stats for Tensorboard
-                mu, kappa = model(pos, z, shapes)
-                all_mus.append(mu.cpu().numpy().flatten())
-                all_kappas.append(kappa.cpu().numpy().flatten())
+    pos = np.stack([ra, dec], axis=1)
+    pos -= pos.mean(axis=0)
 
-        avg_val_loss = np.mean(val_losses)
+    if config.get('inject_signal', False):
+        shapes, target_angles = inject_identity_signal(pos, len(pos))
+    else:
+        # Standard Spin-2 Input
+        e1 = np.cos(double_phi)
+        e2 = np.sin(double_phi)
+        shapes = np.stack([e1, e2], axis=1)
+        target_angles = double_phi
 
-        # --- LOGGING ---
-        print(f"Epoch {epoch + 1}: Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+    device = config['device']
+    t_pos = torch.tensor(pos, device=device)
+    t_z = torch.tensor(z[:, None], device=device)
+    t_shapes = torch.tensor(shapes, device=device)
+    t_target = torch.tensor(target_angles, device=device)
 
-        writer.add_scalar('Loss/Train', avg_train_loss, epoch)
-        writer.add_scalar('Loss/Val', avg_val_loss, epoch)
+    print(f"Building graph (k={config['num_neighbors']})...")
+    edge_index = GraphBuilder.build_edges(t_pos, k=config['num_neighbors'])
 
-        # Log distribution of predictions to ensure we aren't collapsing
-        flat_mus = np.concatenate(all_mus)
-        flat_kappas = np.concatenate(all_kappas)
-        writer.add_histogram('Distribution/Predicted_Mu', flat_mus, epoch)
-        writer.add_histogram('Distribution/Predicted_Kappa', flat_kappas, epoch)
+    return t_pos, t_z, t_shapes, t_target, edge_index
 
-        # --- EARLY STOPPING ---
-        if stopper.early_stop(avg_val_loss):
-            print("Early stopping triggered!")
-            break
 
         # Save best model
         if avg_val_loss == stopper.min_validation_loss:
             torch.save(model.state_dict(), os.path.join(config["log_dir"], "best_model.pth"))
 
-    print("Training complete.")
     writer.close()
 
 
