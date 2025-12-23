@@ -8,6 +8,7 @@ from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 from scipy.spatial import cKDTree
+from scipy.interpolate import interp1d  # <--- NEW DEPENDENCY
 
 from models.vmdn import init_vmdn
 from models.galaxy_gnn import GraphBuilder
