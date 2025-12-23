@@ -14,13 +14,6 @@ class GalaxyDataset(Dataset):
         df = pd.read_csv(csv_file)
         df = df.dropna(subset=["ra", "dec", "mean_z", "phi_deg"]).reset_index(drop=True)
 
-        # --- CRITICAL FIX: Drop NaNs ---
-        # NaNs in RA/Dec/Phi propagate through the GNN and explode the Loss
-        initial_len = len(df)
-        df = df.dropna(subset=['ra', 'dec', 'mean_z', 'phi_deg'])
-        if len(df) < initial_len:
-            print(f"Warning: Dropped {initial_len - len(df)} rows containing NaNs.")
-
         self.ra = df['ra'].values.astype(np.float32)
         self.dec = df['dec'].values.astype(np.float32)
         self.z = df['mean_z'].values.astype(np.float32)

@@ -137,36 +137,15 @@ def load_full_data(config):
                 shapes = batch["input_shapes"].to(config["device"])
                 target = batch["target_phi"].to(config["device"])
 
-    # --- CRITICAL FIX: USE DOUBLE ANGLES ---
-    # Galaxy shapes are Spin-2 (180 deg symmetry).
-    # VMDN models Spin-1 (360 deg symmetry).
-    # We must train on 2*phi so the topology matches.
-    phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
-    double_phi = 2.0 * phi_rad  # [0, 2pi]
-    # ---------------------------------------
+                loss = model.loss(pos, z, shapes, target=target)
+                val_losses.append(loss.item())
 
-    pos = np.stack([ra, dec], axis=1)
-    pos -= pos.mean(axis=0)
+                # Capture stats for Tensorboard
+                mu, kappa = model(pos, z, shapes)
+                all_mus.append(mu.cpu().numpy().flatten())
+                all_kappas.append(kappa.cpu().numpy().flatten())
 
-    if config.get('inject_signal', False):
-        shapes, target_angles = inject_identity_signal(pos, len(pos))
-    else:
-        # Standard Spin-2 Input
-        e1 = np.cos(double_phi)
-        e2 = np.sin(double_phi)
-        shapes = np.stack([e1, e2], axis=1)
-        target_angles = double_phi
-
-    device = config['device']
-    t_pos = torch.tensor(pos, device=device)
-    t_z = torch.tensor(z[:, None], device=device)
-    t_shapes = torch.tensor(shapes, device=device)
-    t_target = torch.tensor(target_angles, device=device)
-
-    print(f"Building graph (k={config['num_neighbors']})...")
-    edge_index = GraphBuilder.build_edges(t_pos, k=config['num_neighbors'])
-
-    return t_pos, t_z, t_shapes, t_target, edge_index
+        avg_val_loss = np.mean(val_losses)
 
 
         # Save best model
@@ -178,7 +157,12 @@ def load_full_data(config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the galaxy orientation model.")
-    parser.add_argument("--config", type=Path, required=True, help="Path to a YAML config file.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config/default.yaml"),
+        help="Path to a YAML config file.",
+    )
     args = parser.parse_args()
 
     train(load_config(args.config))
