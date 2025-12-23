@@ -1,46 +1,115 @@
 import argparse
-import yaml
-import torch
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+import os
 from pathlib import Path
+
+import numpy as np
+import torch
+import torch.optim as optim
+import yaml
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from scipy.spatial import cKDTree
 from datetime import datetime
 
+from dataset import GalaxyDataset
 from models.vmdn import init_vmdn
-from models.galaxy_gnn import GraphBuilder
 
 
-# --- PLOTTING HELPER ---
-def create_density_figure(true, pred, title):
-    """Plots P(pred | true) on the 2*phi domain (0 to 2pi)."""
-    true = np.remainder(true, 2 * np.pi)
-    pred = np.remainder(pred, 2 * np.pi)
+DEFAULT_CONFIG = {
+    "csv_path": "data/des_metacal_angles_minimal.csv",
+    "batch_size": 256,
+    "lr": 1e-3,
+    "epochs": 100,
+    "patience": 10,
+    "num_workers": 4,
+    "log_dir": "runs/galaxy_vmdn_experiment_1",
+    "num_neighbors": 5,
+    "hidden_dim": 64,
+    "num_layers": 3,
+    "vmdn_regularization": 0.1,
+    "device": "auto",
+}
 
-    bins = 64
-    range_lim = [[0, 2 * np.pi], [0, 2 * np.pi]]
 
-    H, xedges, yedges = np.histogram2d(true, pred, bins=bins, range=range_lim)
+class EarlyStopper:
+    def __init__(self, patience=5, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float('inf')
 
-    row_sums = H.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1.0
-    H_norm = H / row_sums
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    im = ax.imshow(H_norm.T, origin='lower', extent=[0, 2 * np.pi, 0, 2 * np.pi],
-                   aspect='auto', cmap='viridis', vmin=0, vmax=np.max(H_norm) * 0.8)
 
-    ax.set_title(title)
-    ax.set_xlabel('True Double Angle (2*phi)')
-    ax.set_ylabel('Predicted Double Angle (2*phi)')
+def load_config(config_path: Path) -> dict:
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
 
-    ax.plot([0, 2 * np.pi], [0, 2 * np.pi], 'r--', alpha=0.5)
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    plt.tight_layout()
-    return fig
+    merged = {**DEFAULT_CONFIG, **config}
+
+    if merged["device"] == "auto":
+        merged["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+
+    repo_root = Path(__file__).resolve().parent
+    for path_key in ("csv_path", "log_dir"):
+        path_value = Path(merged[path_key])
+        if not path_value.is_absolute():
+            merged[path_key] = str((repo_root / path_value).resolve())
+
+    return merged
+
+
+def train(config: dict) -> None:
+    # 1. Setup Data
+    print(f"Loading dataset from {config['csv_path']}...")
+    train_ds = GalaxyDataset(config["csv_path"], num_neighbors=config["num_neighbors"], mode="train")
+    val_ds = GalaxyDataset(config["csv_path"], num_neighbors=config["num_neighbors"], mode="val")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        num_workers=config["num_workers"],
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+    )
+
+    print(f"Train size: {len(train_ds)}, Val size: {len(val_ds)}")
+
+    # 2. Setup Model
+    model = init_vmdn(config).to(config["device"])
+    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
+
+    # 3. Logging & Checkpointing
+    writer = SummaryWriter(config["log_dir"])
+    stopper = EarlyStopper(patience=config["patience"])
+
+    print("Starting training...")
+
+    for epoch in range(config["epochs"]):
+        # --- TRAINING LOOP ---
+        model.train()
+        train_losses = []
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config['epochs']}")
+        for batch in pbar:
+            pos = batch["pos"].to(config["device"])
+            z = batch["redshift"].to(config["device"])
+            shapes = batch["input_shapes"].to(config["device"])
+            target = batch["target_phi"].to(config["device"])
 
 
 def inject_identity_signal(pos, N):
@@ -61,9 +130,12 @@ def load_full_data(config):
     df = pd.read_csv(config['csv_path'])
     df = df.dropna(subset=['ra', 'dec', 'mean_z', 'phi_deg'])
 
-    ra = df['ra'].values.astype(np.float32)
-    dec = df['dec'].values.astype(np.float32)
-    z = df['mean_z'].values.astype(np.float32)
+        with torch.no_grad():
+            for batch in val_loader:
+                pos = batch["pos"].to(config["device"])
+                z = batch["redshift"].to(config["device"])
+                shapes = batch["input_shapes"].to(config["device"])
+                target = batch["target_phi"].to(config["device"])
 
     # --- CRITICAL FIX: USE DOUBLE ANGLES ---
     # Galaxy shapes are Spin-2 (180 deg symmetry).
@@ -97,100 +169,16 @@ def load_full_data(config):
     return t_pos, t_z, t_shapes, t_target, edge_index
 
 
-def train(config):
-    # 1. Load
-    pos, z, shapes, target, edge_index = load_full_data(config)
-    N = pos.shape[0]
-
-    # 2. Split
-    indices = torch.randperm(N)
-    n_train = int(N * 0.8)
-    n_val = int(N * 0.1)
-
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:n_train + n_val]
-    test_idx = indices[n_train + n_val:]
-
-    # 3. Setup with Timestamp
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_name = f"{config.get('run_name', 'run')}_{timestamp}"
-    log_dir = Path(config['log_dir']) / run_name
-
-    print(f"Logging to: {log_dir}")
-
-    model = init_vmdn(config).to(config['device'])
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
-    writer = SummaryWriter(log_dir)
-
-    best_loss = float('inf')
-    patience_counter = 0
-
-    print("Starting Training...")
-
-    for epoch in range(config['epochs']):
-        model.train()
-        optimizer.zero_grad()
-
-        # Subsample for Train Step
-        batch_size = int(len(train_idx) * config.get('subsample_ratio', 0.25))
-        step_indices = train_idx[torch.randperm(len(train_idx))[:batch_size]]
-        step_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
-        step_mask[step_indices] = True
-
-        loss = model.loss(pos, z, shapes, target, edge_index=edge_index, mask=step_mask)
-        loss.backward()
-        optimizer.step()
-
-        # Validation
-        if epoch % 5 == 0:
-            model.eval()
-            with torch.no_grad():
-                val_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
-                val_mask[val_idx] = True
-                val_loss = model.loss(pos, z, shapes, target, edge_index=edge_index, mask=val_mask)
-
-                print(f"Epoch {epoch}: Train Loss {loss.item():.4f} | Val Loss {val_loss.item():.4f}")
-                writer.add_scalar('Loss/Train', loss.item(), epoch)
-                writer.add_scalar('Loss/Val', val_loss.item(), epoch)
-
-                if val_loss < best_loss:
-                    best_loss = val_loss
-                    patience_counter = 0
-                    torch.save(model.state_dict(), log_dir / "best_model.pth")
-                else:
-                    patience_counter += 1
-                    if patience_counter >= config['patience']:
-                        print("Early stopping.")
-                        break
-
-        # Plotting
-        if epoch % 20 == 0:
-            model.eval()
-            with torch.no_grad():
-                mu_all, _ = model(pos, z, shapes, edge_index)
-                mu_np = mu_all.cpu().numpy().flatten()
-                target_np = target.cpu().numpy().flatten()
-
-                # Plot Train Subset (First 5000)
-                sub_idx = train_idx[:5000].cpu().numpy()
-                fig = create_density_figure(target_np[sub_idx], mu_np[sub_idx], f"Train Density (Epoch {epoch})")
-                writer.add_figure("Density/Train", fig, epoch)
+        # Save best model
+        if avg_val_loss == stopper.min_validation_loss:
+            torch.save(model.state_dict(), os.path.join(config["log_dir"], "best_model.pth"))
 
     writer.close()
 
 
 if __name__ == "__main__":
-    conf = {
-        "csv_path": "data/des_metacal_angles_minimal.csv",
-        "lr": 5e-4,
-        "epochs": 1000,
-        "patience": 200,
-        "num_neighbors": 20,
-        "hidden_dim": 128,
-        "subsample_ratio": 0.05,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "log_dir": "runs",
-        "run_name": "identity_check",
-        "inject_signal": True
-    }
-    train(conf)
+    parser = argparse.ArgumentParser(description="Train the galaxy orientation model.")
+    parser.add_argument("--config", type=Path, required=True, help="Path to a YAML config file.")
+    args = parser.parse_args()
+
+    train(load_config(args.config))

@@ -12,6 +12,7 @@ class GalaxyDataset(Dataset):
 
         # 1. Load and Clean Data
         df = pd.read_csv(csv_file)
+        df = df.dropna(subset=["ra", "dec", "mean_z", "phi_deg"]).reset_index(drop=True)
 
         # --- CRITICAL FIX: Drop NaNs ---
         # NaNs in RA/Dec/Phi propagate through the GNN and explode the Loss
@@ -72,5 +73,7 @@ class GalaxyDataset(Dataset):
             'pos': torch.tensor(patch_coords, dtype=torch.float32),
             'redshift': torch.tensor(patch_z, dtype=torch.float32),
             'input_shapes': torch.tensor(patch_input_shapes, dtype=torch.float32),
-            'target_phi': torch.tensor(patch_phi_rad, dtype=torch.float32)
+            'target_phi': torch.tensor(patch_phi_rad, dtype=torch.float32)  # Keep targets in radians
         }
+
+        return sample
