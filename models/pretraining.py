@@ -4,9 +4,14 @@ from .galaxy_gnn import GalaxyLSSBackbone, GalaxyLSSWrapper
 
 
 class GalaxyReconstructor(nn.Module):
+    """
+    Pre-training model that forces the FIRST dimensions of the latent space
+    to reconstruct the physical properties (Redshift and Shape).
+    """
+
     def __init__(self, config):
         super().__init__()
-        # 1. Use the SAME Backbone as your main model
+        # Use exact same backbone configuration as main model
         self.backbone = GalaxyLSSBackbone(
             hidden_dim=config['hidden_dim'],
             num_layers=config.get('num_layers', 3),
@@ -15,44 +20,43 @@ class GalaxyReconstructor(nn.Module):
         )
         self.wrapper = GalaxyLSSWrapper(self.backbone)
 
-        # 2. Reconstruction Heads
-        # Predict Redshift (Scalar)
-        self.z_head = nn.Sequential(
-            nn.Linear(self.wrapper.out_size, 32),
-            nn.SiLU(),
-            nn.Linear(32, 1)
-        )
-
-        # Predict Input Shape (Vector components e1, e2)
-        self.shape_head = nn.Sequential(
-            nn.Linear(self.wrapper.out_size, 32),
-            nn.SiLU(),
-            nn.Linear(32, 2)
-        )
+        # We need to know where the vector features start in the concatenated output
+        self.scalar_dim = self.backbone.s_dim
 
     def forward(self, pos, z, shapes, edge_index):
-        # Get latent representation
+        # Get full latent representation: [h_s, h_v]
+        # shape: [N, scalar_dim + vector_dim]
         feats = self.wrapper(pos, z, shapes, edge_index)
 
-        # Reconstruct properties
-        pred_z = self.z_head(feats)
-        pred_shape = self.shape_head(feats)
+        # --- TRUNCATION STRATEGY ---
+        # 1. Predict Redshift using the FIRST Scalar dimension
+        pred_z = feats[:, 0]  # Shape [N]
+
+        # 2. Predict Shape using the FIRST Vector pair
+        # The wrapper concatenates [scalars, vectors].
+        # Vectors start at index `self.scalar_dim`.
+        # We take the first pair (x, y) which corresponds to (e1, e2).
+        pred_shape = feats[:, self.scalar_dim: self.scalar_dim + 2]  # Shape [N, 2]
 
         return pred_z, pred_shape
 
     def loss(self, pos, z, shapes, edge_index, mask):
         """
-        Reconstruction Loss (MSE) on masked nodes only.
+        Reconstruction Loss forcing latent structure to match physics.
         """
         pred_z, pred_shape = self.forward(pos, z, shapes, edge_index)
 
-        # Compute loss only on the MASKED nodes
-        # We want to predict the values we hid!
-        target_z = z[mask]
+        target_z = z[mask].squeeze()
         target_shape = shapes[mask]
 
-        loss_z = nn.functional.mse_loss(pred_z[mask], target_z)
-        loss_shape = nn.functional.mse_loss(pred_shape[mask], target_shape)
+        # Slice predictions to masked nodes
+        masked_pred_z = pred_z[mask]
+        masked_pred_shape = pred_shape[mask]
 
-        # You can weight these if one dominates
+        # MSE Loss
+        loss_z = nn.functional.mse_loss(masked_pred_z, target_z)
+        loss_shape = nn.functional.mse_loss(masked_pred_shape, target_shape)
+
+        # Weighting: Shape is usually smaller (-1 to 1) than Z (0 to 1.5),
+        # but both are roughly order 1.
         return loss_z + loss_shape

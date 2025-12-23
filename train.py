@@ -242,50 +242,59 @@ def generate_full_catalog_predictions(model, pos, z, shapes, edge_index, num_pas
 
 
 def run_pretraining(config, pos, z, shapes, edge_index):
-    print("\n=== STARTING PRE-TRAINING (Structure Learning) ===")
+    print("\n=== STARTING PRE-TRAINING (Latent Truncation Strategy) ===")
 
-    # 1. Init Reconstructor Model
     pre_model = GalaxyReconstructor(config).to(config['device'])
-    optimizer = torch.optim.Adam(pre_model.parameters(), lr=config['lr'])
+    optimizer = torch.optim.Adam(pre_model.parameters(), lr=1e-3)  # Lower LR for stability
 
-    # 2. Pre-training Loop
-    # Usually needs fewer epochs than main training
-    pretrain_epochs = config.get('pretrain_epochs', 50)
+    # --- STABILITY FIX: Normalize Targets ---
+    # We want z to be roughly mean 0, std 1 so MSE doesn't explode
+    z_mean = z.mean()
+    z_std = z.std() + 1e-6
+    z_norm = (z - z_mean) / z_std
+    # ----------------------------------------
 
     pre_model.train()
-    for epoch in range(pretrain_epochs):
+    epochs = config.get('pretrain_epochs', 50)
+
+    for epoch in range(epochs):
         optimizer.zero_grad()
 
-        # --- MASKING STRATEGY ---
-        # Mask a random subset of nodes (e.g., 25%)
+        # Mask 25% of nodes
         N = pos.shape[0]
         batch_size = int(N * 0.25)
         mask_idx = torch.randperm(N)[:batch_size]
 
-        # Create Masked Inputs (Hide z AND shape)
+        # Create Inputs (Masked)
         masked_shapes = shapes.clone()
-        masked_z = z.clone()
+        masked_z = z_norm.clone()
 
+        # Zero out info for masked nodes
         masked_shapes[mask_idx] = 0.0
-        masked_z[mask_idx] = 0.0  # Or set to mean redshift
+        masked_z[mask_idx] = 0.0
 
-        # Create Boolean Mask
+        # Boolean Mask
         mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
         mask[mask_idx] = True
 
-        # --- FORWARD & LOSS ---
-        # Model tries to guess the true 'z' and 'shapes' of the masked nodes
+        # Pass NORMALIZED z as target, but masked z as input
         loss = pre_model.loss(pos, masked_z, masked_shapes, edge_index, mask)
 
+        if torch.isnan(loss):
+            print("!!! LOSS BECAME NAN !!! Stopping pre-training.")
+            break
+
         loss.backward()
+
+        # Gradient Clipping (Safety net for explosions)
+        torch.nn.utils.clip_grad_norm_(pre_model.parameters(), 1.0)
+
         optimizer.step()
 
         if epoch % 10 == 0:
-            print(f"  [Pretrain Epoch {epoch}] Reconstruction Loss: {loss.item():.6f}")
+            print(f"  [Pretrain Epoch {epoch}] Loss: {loss.item():.6f}")
 
     print("=== PRE-TRAINING COMPLETE ===\n")
-
-    # 3. Save Backbone Weights
     torch.save(pre_model.backbone.state_dict(), "pretrained_backbone.pth")
     return "pretrained_backbone.pth"
 
@@ -298,7 +307,7 @@ def train(config: dict) -> None:
     if config.get('do_pretrain', True):
         weights_path = run_pretraining(config, pos, z, shapes, edge_index)
 
-    pos, z, shapes, target, edge_index, normalizer = load_full_data(config)
+
     N = pos.shape[0]
 
     indices = torch.randperm(N)
