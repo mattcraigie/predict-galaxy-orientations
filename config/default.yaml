@@ -4,7 +4,7 @@ lr: 0.001
 epochs: 100
 patience: 10
 num_workers: 4
-log_dir: runs/galaxy_vmdn_experiment_1
+log_dir: runs/galaxy_vmdn_experiment_real_data
 num_neighbors: 5
 hidden_dim: 64
 num_layers: 3

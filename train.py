@@ -46,6 +46,32 @@ def load_config(config_path: Path) -> dict:
     return merged
 
 
+def check_for_leaks(pos, edge_index):
+    print("--- RUNNING LEAK CHECK ---")
+    src, dst = edge_index
+
+    # Calculate distances for all edges
+    dist = torch.norm(pos[src] - pos[dst], dim=1)
+
+    # Count how many neighbors are impossibly close (e.g., < 0.1 arcseconds approx)
+    # Assuming pos is in degrees, 0.0001 deg is ~0.36 arcsec
+    # If pos is normalized/projected, adjust threshold accordingly.
+    # Since you normalized by subtracting mean, scale is preserved.
+
+    num_zeros = (dist < 1e-5).sum().item()
+    min_dist = dist.min().item()
+
+    print(f"Minimum Neighbor Distance: {min_dist:.6f}")
+    print(f"Edges with dist ~ 0: {num_zeros} / {len(dist)}")
+
+    if num_zeros > 0:
+        print("!!! CRITICAL WARNING: DUPLICATES DETECTED !!!")
+        print("The model is likely copying the target from a duplicate neighbor.")
+    else:
+        print("No distance-based leaks detected.")
+    print("--------------------------")
+
+
 # --- PLOTTING HELPERS ---
 def create_density_figure(true, pred, title):
     """Plots P(pred | true) on the 2*phi domain (0 to 2pi)."""
@@ -101,12 +127,14 @@ def load_full_data(config):
     target_angles = 2.0 * phi_rad
 
     if config.get('inject_signal', False):
+        print("Injecting signal...")
         shapes, target_angles = inject_identity_signal(pos, len(pos))
     else:
         # Standard Spin-2 Input
         e1 = np.cos(target_angles)
         e2 = np.sin(target_angles)
         shapes = np.stack([e1, e2], axis=1)
+        print("Running with standard spin-2 input...")
 
     device = config['device']
     t_pos = torch.tensor(pos, device=device)
@@ -116,6 +144,8 @@ def load_full_data(config):
 
     print(f"Building graph (k={config['num_neighbors']})...")
     edge_index = GraphBuilder.build_edges(t_pos, k=config['num_neighbors'])
+
+    check_for_leaks(t_pos, edge_index)
 
     return t_pos, t_z, t_shapes, t_target, edge_index
 
