@@ -167,7 +167,13 @@ def load_full_data(config):
         shapes, target_angles = inject_smooth_signal(pos)
         # Note: We usually DON'T normalize injected signals because they are already smooth/known
         # But if you want to test the normalizer, you can fit it here too.
-        normalizer = None
+        # --- APPLY CDF NORMALIZATION ---
+        normalizer = CDFNormalizer()
+        normalizer.fit(target_angles)  # Learn the "Grid Locking" or other biases
+        target_angles = normalizer.transform(target_angles)  # Warp to Uniform
+        e1 = np.cos(target_angles)
+        e2 = np.sin(target_angles)
+        shapes = np.stack([e1, e2], axis=1)
     else:
         # Real Data
         phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
