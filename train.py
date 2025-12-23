@@ -9,6 +9,8 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from scipy.spatial import cKDTree
+from datetime import datetime
 
 from dataset import GalaxyDataset
 from models.vmdn import init_vmdn
@@ -109,25 +111,24 @@ def train(config: dict) -> None:
             shapes = batch["input_shapes"].to(config["device"])
             target = batch["target_phi"].to(config["device"])
 
-            optimizer.zero_grad()
 
-            # Forward pass is handled inside loss() usually,
-            # but we call loss() directly on the VMDN wrapper
-            loss = model.loss(pos, z, shapes, target=target)
+def inject_identity_signal(pos, N):
+    print("!!! INJECTING SIGNAL: IDENTITY MAPPING !!!")
+    # Generate random targets in 0-2pi (representing 2*phi)
+    new_targets = np.random.uniform(0, 2 * np.pi, size=N).astype(np.float32)
 
-            loss.backward()
-            optimizer.step()
+    # Input is cos/sin of this target
+    e1 = np.cos(new_targets)  # Note: new_targets is already 2*phi
+    e2 = np.sin(new_targets)
+    new_inputs = np.stack([e1, e2], axis=1).astype(np.float32)
 
-            train_losses.append(loss.item())
-            pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+    return new_inputs, new_targets
 
-        avg_train_loss = np.mean(train_losses)
 
-        # --- VALIDATION LOOP ---
-        model.eval()
-        val_losses = []
-        all_mus = []
-        all_kappas = []
+def load_full_data(config):
+    print(f"Loading full catalog from {config['csv_path']}...")
+    df = pd.read_csv(config['csv_path'])
+    df = df.dropna(subset=['ra', 'dec', 'mean_z', 'phi_deg'])
 
         with torch.no_grad():
             for batch in val_loader:
@@ -146,28 +147,11 @@ def train(config: dict) -> None:
 
         avg_val_loss = np.mean(val_losses)
 
-        # --- LOGGING ---
-        print(f"Epoch {epoch + 1}: Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-
-        writer.add_scalar('Loss/Train', avg_train_loss, epoch)
-        writer.add_scalar('Loss/Val', avg_val_loss, epoch)
-
-        # Log distribution of predictions to ensure we aren't collapsing
-        flat_mus = np.concatenate(all_mus)
-        flat_kappas = np.concatenate(all_kappas)
-        writer.add_histogram('Distribution/Predicted_Mu', flat_mus, epoch)
-        writer.add_histogram('Distribution/Predicted_Kappa', flat_kappas, epoch)
-
-        # --- EARLY STOPPING ---
-        if stopper.early_stop(avg_val_loss):
-            print("Early stopping triggered!")
-            break
 
         # Save best model
         if avg_val_loss == stopper.min_validation_loss:
             torch.save(model.state_dict(), os.path.join(config["log_dir"], "best_model.pth"))
 
-    print("Training complete.")
     writer.close()
 
 
