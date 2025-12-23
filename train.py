@@ -180,23 +180,38 @@ def train(config: dict) -> None:
         model.train()
         optimizer.zero_grad()
 
-        # Stochastic Mask
+        # 1. Select Targets (Subsample)
         batch_size = int(len(train_idx) * config.get('subsample_ratio', 0.25))
         mask_idx = train_idx[torch.randperm(len(train_idx))[:batch_size]]
+
+        # 2. Create Masked Input
+        # We COPY shapes so we don't modify the original data
+        masked_shapes = shapes.clone()
+        # Zero out the shapes of the galaxies we are trying to predict
+        masked_shapes[mask_idx] = 0.0
+
+        # 3. Create Loss Mask
         step_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
         step_mask[mask_idx] = True
 
-        loss = model.loss(pos, z, shapes, target, edge_index=edge_index, mask=step_mask)
+        # 4. Forward Pass using MASKED shapes
+        # The model predicts everything, but 'mask_idx' nodes have input=0
+        loss = model.loss(pos, z, masked_shapes, target, edge_index=edge_index, mask=step_mask)
         loss.backward()
         optimizer.step()
 
-        # Validation
+        # --- VALIDATION STEP ---
         if epoch % 5 == 0:
             model.eval()
             with torch.no_grad():
+                # For validation, we also must mask the targets to be fair!
+                val_shapes = shapes.clone()
+                val_shapes[val_idx] = 0.0
+
                 val_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
                 val_mask[val_idx] = True
-                val_loss = model.loss(pos, z, shapes, target, edge_index=edge_index, mask=val_mask)
+
+                val_loss = model.loss(pos, z, val_shapes, target, edge_index=edge_index, mask=val_mask)
 
                 print(f"Epoch {epoch}: Train {loss.item():.4f} | Val {val_loss.item():.4f}")
                 writer.add_scalar('Loss/Train', loss.item(), epoch)
@@ -212,11 +227,15 @@ def train(config: dict) -> None:
                         print("Early stopping triggered.")
                         break
 
-        # Plotting
+        # --- PLOTTING DIAGNOSTICS ---
         if epoch % 20 == 0:
             model.eval()
             with torch.no_grad():
-                mu_all, _ = model(pos, z, shapes, edge_index)
+                # Plotting also needs masking to show true performance
+                plot_shapes = shapes.clone()
+                plot_shapes[train_idx] = 0.0  # Blind the model to train set
+
+                mu_all, _ = model(pos, z, plot_shapes, edge_index)
                 t_np = target.cpu().numpy().flatten()
                 m_np = mu_all.cpu().numpy().flatten()
 
