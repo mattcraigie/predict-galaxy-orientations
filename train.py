@@ -182,11 +182,11 @@ def train(config):
 if __name__ == "__main__":
     conf = {
         "csv_path": "data/des_metacal_angles_minimal.csv",
-        "lr": 5e-3,
+        "lr": 5e-4,
         "epochs": 1000,
         "patience": 50,
         "num_neighbors": 20,
-        "hidden_dim": 64,
+        "hidden_dim": 128,
         "subsample_ratio": 0.25,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "log_dir": "runs",
