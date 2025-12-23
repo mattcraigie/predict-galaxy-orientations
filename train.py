@@ -14,55 +14,44 @@ from models.galaxy_gnn import GraphBuilder
 
 
 # --- PLOTTING HELPER ---
-def plot_conditional_density(true, pred, title, filename):
+def create_density_figure(true, pred, title):
     """
-    Plots the conditional density P(pred | true).
-    x-axis: True Angle
-    y-axis: Predicted Angle
-    Color: Probability density (columns sum to 1).
+    Creates a Matplotlib Figure for P(pred | true).
+    Returns the figure object for TensorBoard logging.
     """
-    # Ensure inputs are numpy arrays in range [0, 2pi]
+    # Normalize to [0, 2pi]
     true = np.remainder(true, 2 * np.pi)
     pred = np.remainder(pred, 2 * np.pi)
 
-    # Binning configuration
     bins = 64
     range_lim = [[0, 2 * np.pi], [0, 2 * np.pi]]
 
-    # 1. Compute 2D Histogram
-    # H[i, j] is count in x_bin[i] and y_bin[j]
-    # x (rows) = true, y (cols) = pred
+    # Compute 2D Histogram
     H, xedges, yedges = np.histogram2d(true, pred, bins=bins, range=range_lim)
 
-    # 2. Normalize to get P(pred | true)
-    # We divide each "True" row by the sum of that row
-    # (handling division by zero)
+    # Normalize rows to get P(pred | true)
     row_sums = H.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1.0
     H_norm = H / row_sums
 
-    # 3. Plot
-    fig, ax = plt.subplots(figsize=(8, 7))
-    # We transpose H_norm because imshow expects (y, x) but histogram2d returns (x, y) logic relative to bins
+    fig, ax = plt.subplots(figsize=(6, 6))
     im = ax.imshow(H_norm.T, origin='lower', extent=[0, 2 * np.pi, 0, 2 * np.pi],
                    aspect='auto', cmap='viridis', vmin=0, vmax=np.max(H_norm) * 0.8)
 
     ax.set_title(title)
-    ax.set_xlabel('True Angle (Radians)')
-    ax.set_ylabel('Predicted Angle (Radians)')
+    ax.set_xlabel('True Angle')
+    ax.set_ylabel('Predicted Angle')
 
-    # Add diagonal reference line
-    ax.plot([0, 2 * np.pi], [0, 2 * np.pi], 'r--', alpha=0.5, label='Perfect Prediction')
-    ax.legend()
+    # Diagonal reference line
+    ax.plot([0, 2 * np.pi], [0, 2 * np.pi], 'r--', alpha=0.5)
 
-    plt.colorbar(im, ax=ax, label='P(Pred | True)')
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
-    plt.savefig(filename)
-    plt.close()
-    print(f"Saved plot to {filename}")
+
+    return fig
 
 
-# --- SIGNAL HELPERS ---
+# --- SIGNAL HELPER ---
 def inject_identity_signal(pos, old_targets):
     print("!!! INJECTING SIGNAL: IDENTITY MAPPING !!!")
     new_targets = np.random.uniform(0, 2 * np.pi, size=len(pos)).astype(np.float32)
@@ -85,7 +74,7 @@ def load_full_data(config):
     pos = np.stack([ra, dec], axis=1)
     pos -= pos.mean(axis=0)
 
-    # Signal Injection Logic
+    # Signal Injection
     if config.get('inject_signal', False):
         shapes, phi_rad = inject_identity_signal(pos, phi_rad)
     else:
@@ -110,11 +99,10 @@ def train(config):
     pos, z, shapes, target, edge_index = load_full_data(config)
     N = pos.shape[0]
 
-    # 2. Split Indices (Train / Val / Test)
+    # 2. Split Indices
     indices = torch.randperm(N)
     n_train = int(N * 0.8)
     n_val = int(N * 0.1)
-    # The remainder is Test
 
     train_idx = indices[:n_train]
     val_idx = indices[n_train:n_train + n_val]
@@ -148,7 +136,7 @@ def train(config):
         optimizer.step()
 
         # Validation Step
-        if epoch % 10 == 0:
+        if epoch % 5 == 0:
             model.eval()
             with torch.no_grad():
                 val_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
@@ -170,41 +158,32 @@ def train(config):
                         print("Early stopping triggered.")
                         break
 
-    # --- FINAL EVALUATION ---
-    print("\n--- Generating Evaluation Plots ---")
+        # --- TENSORBOARD PLOTTING (Every 20 epochs) ---
+        if epoch % 20 == 0:
+            model.eval()
+            with torch.no_grad():
+                mu_all, _ = model(pos, z, shapes, edge_index)
+                mu_np = mu_all.cpu().numpy().flatten()
+                target_np = target.cpu().numpy().flatten()
 
-    # Load best model
-    model.load_state_dict(torch.load(f"{config['log_dir']}/best_model.pth"))
-    model.eval()
+                # Plot Train Subset
+                train_sub = train_idx[:10000].cpu().numpy()  # Subsample for speed
+                fig_train = create_density_figure(
+                    target_np[train_sub], mu_np[train_sub],
+                    f"Train Density (Epoch {epoch})"
+                )
+                writer.add_figure("Density/Train", fig_train, epoch)
 
-    with torch.no_grad():
-        # Get predictions for all data (faster than batching since we loaded full batch anyway)
-        mu_all, kappa_all = model(pos, z, shapes, edge_index)
+                # Plot Val Subset
+                val_sub = val_idx.cpu().numpy()
+                fig_val = create_density_figure(
+                    target_np[val_sub], mu_np[val_sub],
+                    f"Val Density (Epoch {epoch})"
+                )
+                writer.add_figure("Density/Val", fig_val, epoch)
 
-        # Move to CPU numpy for plotting
-        mu_np = mu_all.cpu().numpy().flatten()
-        target_np = target.cpu().numpy().flatten()
-
-        # Slice for Train
-        train_mu = mu_np[train_idx.cpu().numpy()]
-        train_true = target_np[train_idx.cpu().numpy()]
-
-        # Slice for Test
-        test_mu = mu_np[test_idx.cpu().numpy()]
-        test_true = target_np[test_idx.cpu().numpy()]
-
-        # Plot
-        plot_conditional_density(
-            train_true, train_mu,
-            title=f"Train Set: P(Pred | True) - {config.get('log_dir').split('/')[-1]}",
-            filename=f"{config['log_dir']}/density_train.png"
-        )
-
-        plot_conditional_density(
-            test_true, test_mu,
-            title=f"Test Set: P(Pred | True) - {config.get('log_dir').split('/')[-1]}",
-            filename=f"{config['log_dir']}/density_test.png"
-        )
+    print("Training complete. Check TensorBoard for plots.")
+    writer.close()
 
 
 if __name__ == "__main__":
@@ -212,12 +191,12 @@ if __name__ == "__main__":
         "csv_path": "data/des_metacal_angles_minimal.csv",
         "lr": 5e-3,
         "epochs": 1000,
-        "patience": 20,
+        "patience": 50,
         "num_neighbors": 20,
         "hidden_dim": 64,
         "subsample_ratio": 0.25,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "log_dir": "runs/identity_check_v2",
+        "log_dir": "runs/identity_check_tb",
         "inject_signal": True
     }
     train(conf)
