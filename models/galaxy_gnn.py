@@ -103,7 +103,7 @@ class SparseLocalFrameLayer(nn.Module):
         out_s.index_add_(0, dst, msg_s)
         out_v.index_add_(0, dst, msg_v)
 
-        return h_s + out_s, h_v + out_v
+        return h_s + out_s, out_v
 
 
 class GalaxyLSSBackbone(nn.Module):
