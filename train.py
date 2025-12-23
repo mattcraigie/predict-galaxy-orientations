@@ -31,83 +31,61 @@ DEFAULT_CONFIG = {
 def load_config(config_path: Path) -> dict:
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
-
     merged = {**DEFAULT_CONFIG, **config}
-
     if merged["device"] == "auto":
         merged["device"] = "cuda" if torch.cuda.is_available() else "cpu"
-
     repo_root = Path(__file__).resolve().parent
     for path_key in ("csv_path", "log_dir"):
         path_value = Path(merged[path_key])
         if not path_value.is_absolute():
             merged[path_key] = str((repo_root / path_value).resolve())
-
     return merged
 
 
-def check_for_leaks(pos, edge_index):
-    print("--- RUNNING LEAK CHECK ---")
-    src, dst = edge_index
-
-    # Calculate distances for all edges
-    dist = torch.norm(pos[src] - pos[dst], dim=1)
-
-    # Count how many neighbors are impossibly close (e.g., < 0.1 arcseconds approx)
-    # Assuming pos is in degrees, 0.0001 deg is ~0.36 arcsec
-    # If pos is normalized/projected, adjust threshold accordingly.
-    # Since you normalized by subtracting mean, scale is preserved.
-
-    num_zeros = (dist < 1e-5).sum().item()
-    min_dist = dist.min().item()
-
-    print(f"Minimum Neighbor Distance: {min_dist:.6f}")
-    print(f"Edges with dist ~ 0: {num_zeros} / {len(dist)}")
-
-    if num_zeros > 0:
-        print("!!! CRITICAL WARNING: DUPLICATES DETECTED !!!")
-        print("The model is likely copying the target from a duplicate neighbor.")
-    else:
-        print("No distance-based leaks detected.")
-    print("--------------------------")
-
-
-# --- PLOTTING HELPERS ---
+# --- PLOTTING ---
 def create_density_figure(true, pred, title):
-    """Plots P(pred | true) on the 2*phi domain (0 to 2pi)."""
     true = np.remainder(true, 2 * np.pi)
     pred = np.remainder(pred, 2 * np.pi)
-
     bins = 64
-    range_lim = [[0, 2 * np.pi], [0, 2 * np.pi]]
-
-    H, xedges, yedges = np.histogram2d(true, pred, bins=bins, range=range_lim)
+    H, _, _ = np.histogram2d(true, pred, bins=bins, range=[[0, 2 * np.pi], [0, 2 * np.pi]])
     row_sums = H.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1.0
     H_norm = H / row_sums
-
     fig, ax = plt.subplots(figsize=(6, 6))
-    im = ax.imshow(H_norm.T, origin='lower', extent=[0, 2 * np.pi, 0, 2 * np.pi],
-                   aspect='auto', cmap='viridis', vmin=0, vmax=np.max(H_norm) * 0.8)
-
+    im = ax.imshow(H_norm.T, origin='lower', extent=[0, 2 * np.pi, 0, 2 * np.pi], aspect='auto', cmap='viridis', vmin=0,
+                   vmax=np.max(H_norm) * 0.8)
     ax.set_title(title)
-    ax.set_xlabel('True Double Angle (2*phi)')
-    ax.set_ylabel('Pred Double Angle (2*phi)')
     ax.plot([0, 2 * np.pi], [0, 2 * np.pi], 'r--', alpha=0.5)
-
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    plt.tight_layout()
+    plt.colorbar(im, ax=ax)
     return fig
 
 
-# --- DATA LOADING ---
-def inject_identity_signal(pos, N):
-    print("!!! INJECTING SIGNAL: IDENTITY MAPPING !!!")
-    new_targets = np.random.uniform(0, 2 * np.pi, size=N).astype(np.float32)
-    e1 = np.cos(new_targets)
-    e2 = np.sin(new_targets)
+# --- SIGNAL INJECTION FIX ---
+def inject_smooth_signal(pos):
+    """
+    Creates a signal where orientation depends on POSITION.
+    This ensures neighbors have similar orientations, making
+    the task solvable even when the target node is masked.
+    """
+    print("!!! INJECTING SIGNAL: SMOOTH SPATIAL FIELD !!!")
+
+    # Example: A giant swirl/vortex based on coordinates
+    # Angle = arctan2(y, x) + distance
+    # This is smooth, so A is similar to B.
+    x = pos[:, 0]
+    y = pos[:, 1]
+
+    # Target is 2*phi domain [0, 2pi]
+    # We use a frequency multiplier to make it vary across the sky
+    freq = 10.0
+    target_angles = np.remainder(np.arctan2(y, x) * freq, 2 * np.pi).astype(np.float32)
+
+    # Inputs match the target field perfectly
+    e1 = np.cos(target_angles)
+    e2 = np.sin(target_angles)
     new_inputs = np.stack([e1, e2], axis=1).astype(np.float32)
-    return new_inputs, new_targets
+
+    return new_inputs, target_angles
 
 
 def load_full_data(config):
@@ -118,23 +96,23 @@ def load_full_data(config):
     ra = df['ra'].values.astype(np.float32)
     dec = df['dec'].values.astype(np.float32)
     pos = np.stack([ra, dec], axis=1)
-    pos -= pos.mean(axis=0)
+
+    # Normalize positions to [-1, 1] range for the synthetic signal to look nice
+    pos_min, pos_max = pos.min(axis=0), pos.max(axis=0)
+    pos = (pos - pos_min) / (pos_max - pos_min) * 2 - 1
 
     z = df['mean_z'].values.astype(np.float32)
 
-    # Target is 2*phi (Spin-1 domain)
-    phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
-    target_angles = 2.0 * phi_rad
-
+    # Logic Branch
     if config.get('inject_signal', False):
-        print("Injecting signal...")
-        shapes, target_angles = inject_identity_signal(pos, len(pos))
+        shapes, target_angles = inject_smooth_signal(pos)
     else:
-        # Standard Spin-2 Input
+        # Real Data
+        phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
+        target_angles = 2.0 * phi_rad
         e1 = np.cos(target_angles)
         e2 = np.sin(target_angles)
         shapes = np.stack([e1, e2], axis=1)
-        print("Running with standard spin-2 input...")
 
     device = config['device']
     t_pos = torch.tensor(pos, device=device)
@@ -145,12 +123,9 @@ def load_full_data(config):
     print(f"Building graph (k={config['num_neighbors']})...")
     edge_index = GraphBuilder.build_edges(t_pos, k=config['num_neighbors'])
 
-    check_for_leaks(t_pos, edge_index)
-
     return t_pos, t_z, t_shapes, t_target, edge_index
 
 
-# --- TRAIN LOOP ---
 def train(config: dict) -> None:
     pos, z, shapes, target, edge_index = load_full_data(config)
     N = pos.shape[0]
@@ -180,34 +155,28 @@ def train(config: dict) -> None:
         model.train()
         optimizer.zero_grad()
 
-        # 1. Select Targets (Subsample)
+        # 1. Masking Strategy
         batch_size = int(len(train_idx) * config.get('subsample_ratio', 0.25))
         mask_idx = train_idx[torch.randperm(len(train_idx))[:batch_size]]
 
-        # 2. Create Masked Input
-        # We COPY shapes so we don't modify the original data
+        # Zero out inputs for the target nodes (Blind Spot)
         masked_shapes = shapes.clone()
-        # Zero out the shapes of the galaxies we are trying to predict
         masked_shapes[mask_idx] = 0.0
 
-        # 3. Create Loss Mask
+        # Loss calculated only on masked nodes
         step_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
         step_mask[mask_idx] = True
 
-        # 4. Forward Pass using MASKED shapes
-        # The model predicts everything, but 'mask_idx' nodes have input=0
         loss = model.loss(pos, z, masked_shapes, target, edge_index=edge_index, mask=step_mask)
         loss.backward()
         optimizer.step()
 
-        # --- VALIDATION STEP ---
+        # 2. Validation
         if epoch % 5 == 0:
             model.eval()
             with torch.no_grad():
-                # For validation, we also must mask the targets to be fair!
                 val_shapes = shapes.clone()
                 val_shapes[val_idx] = 0.0
-
                 val_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
                 val_mask[val_idx] = True
 
@@ -224,16 +193,17 @@ def train(config: dict) -> None:
                 else:
                     patience_counter += 1
                     if patience_counter >= config['patience']:
-                        print("Early stopping triggered.")
+                        print("Early stopping.")
                         break
 
-        # --- PLOTTING DIAGNOSTICS ---
+        # 3. Plotting
         if epoch % 20 == 0:
             model.eval()
             with torch.no_grad():
-                # Plotting also needs masking to show true performance
+                # For plotting, we blindly predict everything.
+                # To see true performance, we should mask the train set inputs.
                 plot_shapes = shapes.clone()
-                plot_shapes[train_idx] = 0.0  # Blind the model to train set
+                plot_shapes[train_idx] = 0.0
 
                 mu_all, _ = model(pos, z, plot_shapes, edge_index)
                 t_np = target.cpu().numpy().flatten()
@@ -249,6 +219,6 @@ def train(config: dict) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, required=True, help="Path to config file.")
+    parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     train(load_config(args.config))
