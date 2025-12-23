@@ -8,6 +8,7 @@ from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from scipy.spatial import cKDTree
+from datetime import datetime
 
 from models.vmdn import init_vmdn
 from models.galaxy_gnn import GraphBuilder
@@ -15,21 +16,15 @@ from models.galaxy_gnn import GraphBuilder
 
 # --- PLOTTING HELPER ---
 def create_density_figure(true, pred, title):
-    """
-    Creates a Matplotlib Figure for P(pred | true).
-    Returns the figure object for TensorBoard logging.
-    """
-    # Normalize to [0, 2pi]
+    """Plots P(pred | true) on the 2*phi domain (0 to 2pi)."""
     true = np.remainder(true, 2 * np.pi)
     pred = np.remainder(pred, 2 * np.pi)
 
     bins = 64
     range_lim = [[0, 2 * np.pi], [0, 2 * np.pi]]
 
-    # Compute 2D Histogram
     H, xedges, yedges = np.histogram2d(true, pred, bins=bins, range=range_lim)
 
-    # Normalize rows to get P(pred | true)
     row_sums = H.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1.0
     H_norm = H / row_sums
@@ -39,25 +34,25 @@ def create_density_figure(true, pred, title):
                    aspect='auto', cmap='viridis', vmin=0, vmax=np.max(H_norm) * 0.8)
 
     ax.set_title(title)
-    ax.set_xlabel('True Angle')
-    ax.set_ylabel('Predicted Angle')
+    ax.set_xlabel('True Double Angle (2*phi)')
+    ax.set_ylabel('Predicted Double Angle (2*phi)')
 
-    # Diagonal reference line
     ax.plot([0, 2 * np.pi], [0, 2 * np.pi], 'r--', alpha=0.5)
-
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
-
     return fig
 
 
-# --- SIGNAL HELPER ---
-def inject_identity_signal(pos, old_targets):
+def inject_identity_signal(pos, N):
     print("!!! INJECTING SIGNAL: IDENTITY MAPPING !!!")
-    new_targets = np.random.uniform(0, 2 * np.pi, size=len(pos)).astype(np.float32)
-    e1 = np.cos(2 * new_targets)
-    e2 = np.sin(2 * new_targets)
+    # Generate random targets in 0-2pi (representing 2*phi)
+    new_targets = np.random.uniform(0, 2 * np.pi, size=N).astype(np.float32)
+
+    # Input is cos/sin of this target
+    e1 = np.cos(new_targets)  # Note: new_targets is already 2*phi
+    e2 = np.sin(new_targets)
     new_inputs = np.stack([e1, e2], axis=1).astype(np.float32)
+
     return new_inputs, new_targets
 
 
@@ -69,24 +64,32 @@ def load_full_data(config):
     ra = df['ra'].values.astype(np.float32)
     dec = df['dec'].values.astype(np.float32)
     z = df['mean_z'].values.astype(np.float32)
+
+    # --- CRITICAL FIX: USE DOUBLE ANGLES ---
+    # Galaxy shapes are Spin-2 (180 deg symmetry).
+    # VMDN models Spin-1 (360 deg symmetry).
+    # We must train on 2*phi so the topology matches.
     phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
+    double_phi = 2.0 * phi_rad  # [0, 2pi]
+    # ---------------------------------------
 
     pos = np.stack([ra, dec], axis=1)
     pos -= pos.mean(axis=0)
 
-    # Signal Injection
     if config.get('inject_signal', False):
-        shapes, phi_rad = inject_identity_signal(pos, phi_rad)
+        shapes, target_angles = inject_identity_signal(pos, len(pos))
     else:
-        e1 = np.cos(2 * phi_rad)
-        e2 = np.sin(2 * phi_rad)
+        # Standard Spin-2 Input
+        e1 = np.cos(double_phi)
+        e2 = np.sin(double_phi)
         shapes = np.stack([e1, e2], axis=1)
+        target_angles = double_phi
 
     device = config['device']
     t_pos = torch.tensor(pos, device=device)
     t_z = torch.tensor(z[:, None], device=device)
     t_shapes = torch.tensor(shapes, device=device)
-    t_target = torch.tensor(phi_rad, device=device)
+    t_target = torch.tensor(target_angles, device=device)
 
     print(f"Building graph (k={config['num_neighbors']})...")
     edge_index = GraphBuilder.build_edges(t_pos, k=config['num_neighbors'])
@@ -95,11 +98,11 @@ def load_full_data(config):
 
 
 def train(config):
-    # 1. Load Data
+    # 1. Load
     pos, z, shapes, target, edge_index = load_full_data(config)
     N = pos.shape[0]
 
-    # 2. Split Indices
+    # 2. Split
     indices = torch.randperm(N)
     n_train = int(N * 0.8)
     n_val = int(N * 0.1)
@@ -108,13 +111,16 @@ def train(config):
     val_idx = indices[n_train:n_train + n_val]
     test_idx = indices[n_train + n_val:]
 
-    print(f"Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+    # 3. Setup with Timestamp
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = f"{config.get('run_name', 'run')}_{timestamp}"
+    log_dir = Path(config['log_dir']) / run_name
 
-    # 3. Setup
+    print(f"Logging to: {log_dir}")
+
     model = init_vmdn(config).to(config['device'])
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
-    writer = SummaryWriter(config['log_dir'])
-    Path(config['log_dir']).mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir)
 
     best_loss = float('inf')
     patience_counter = 0
@@ -125,7 +131,7 @@ def train(config):
         model.train()
         optimizer.zero_grad()
 
-        # Stochastic Train Step
+        # Subsample for Train Step
         batch_size = int(len(train_idx) * config.get('subsample_ratio', 0.25))
         step_indices = train_idx[torch.randperm(len(train_idx))[:batch_size]]
         step_mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
@@ -135,7 +141,7 @@ def train(config):
         loss.backward()
         optimizer.step()
 
-        # Validation Step
+        # Validation
         if epoch % 5 == 0:
             model.eval()
             with torch.no_grad():
@@ -147,18 +153,17 @@ def train(config):
                 writer.add_scalar('Loss/Train', loss.item(), epoch)
                 writer.add_scalar('Loss/Val', val_loss.item(), epoch)
 
-                # Checkpoint
                 if val_loss < best_loss:
                     best_loss = val_loss
                     patience_counter = 0
-                    torch.save(model.state_dict(), f"{config['log_dir']}/best_model.pth")
+                    torch.save(model.state_dict(), log_dir / "best_model.pth")
                 else:
                     patience_counter += 1
                     if patience_counter >= config['patience']:
-                        print("Early stopping triggered.")
+                        print("Early stopping.")
                         break
 
-        # --- TENSORBOARD PLOTTING (Every 20 epochs) ---
+        # Plotting
         if epoch % 20 == 0:
             model.eval()
             with torch.no_grad():
@@ -166,23 +171,11 @@ def train(config):
                 mu_np = mu_all.cpu().numpy().flatten()
                 target_np = target.cpu().numpy().flatten()
 
-                # Plot Train Subset
-                train_sub = train_idx[:10000].cpu().numpy()  # Subsample for speed
-                fig_train = create_density_figure(
-                    target_np[train_sub], mu_np[train_sub],
-                    f"Train Density (Epoch {epoch})"
-                )
-                writer.add_figure("Density/Train", fig_train, epoch)
+                # Plot Train Subset (First 5000)
+                sub_idx = train_idx[:5000].cpu().numpy()
+                fig = create_density_figure(target_np[sub_idx], mu_np[sub_idx], f"Train Density (Epoch {epoch})")
+                writer.add_figure("Density/Train", fig, epoch)
 
-                # Plot Val Subset
-                val_sub = val_idx.cpu().numpy()
-                fig_val = create_density_figure(
-                    target_np[val_sub], mu_np[val_sub],
-                    f"Val Density (Epoch {epoch})"
-                )
-                writer.add_figure("Density/Val", fig_val, epoch)
-
-    print("Training complete. Check TensorBoard for plots.")
     writer.close()
 
 
@@ -196,7 +189,8 @@ if __name__ == "__main__":
         "hidden_dim": 64,
         "subsample_ratio": 0.25,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "log_dir": "runs/identity_check_tb",
+        "log_dir": "runs",
+        "run_name": "identity_check",
         "inject_signal": True
     }
     train(conf)

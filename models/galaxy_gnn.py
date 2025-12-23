@@ -6,14 +6,11 @@ from scipy.spatial import cKDTree
 
 
 class GraphBuilder:
-    """Helper to construct edge indices."""
-
     @staticmethod
     def build_edges(pos: torch.Tensor, mode: str = "knn", k: int = 20) -> torch.Tensor:
         device = pos.device
         pos_np = pos.detach().cpu().numpy()
 
-        # Squeeze batch dim if B=1
         if pos.dim() == 3 and pos.shape[0] == 1:
             pos_np = pos_np[0]
 
@@ -24,6 +21,7 @@ class GraphBuilder:
             tree = cKDTree(pos_np)
             _, idx = tree.query(pos_np, k=k_eff + 1)
 
+            # Remove self-loops (index 0)
             src = idx[:, 1:].flatten()
             dst = np.repeat(np.arange(num_points), k_eff)
 
@@ -34,12 +32,10 @@ class GraphBuilder:
 
             return edge_index
         else:
-            raise NotImplementedError("Only kNN supported for Full Batch currently")
+            raise NotImplementedError("Only kNN supported currently")
 
 
 class SparseLocalFrameLayer(nn.Module):
-    """Rotation-Equivariant GNN Layer"""
-
     def __init__(self, scalar_dim: int, vector_dim: int, spin_symmetry: int = 2):
         super().__init__()
         self.scalar_dim = scalar_dim
@@ -57,7 +53,7 @@ class SparseLocalFrameLayer(nn.Module):
     def forward(self, h_s, h_v, edge_index, pos, orientation):
         src, dst = edge_index[0], edge_index[1]
 
-        # 1. Geometry
+        # Geometry
         delta_pos = pos[src] - pos[dst]
         dist = torch.norm(delta_pos, dim=1, keepdim=True) + 1e-6
         phi_global = torch.atan2(delta_pos[:, 1], delta_pos[:, 0])
@@ -71,7 +67,7 @@ class SparseLocalFrameLayer(nn.Module):
             torch.sin(self.spin_symmetry * delta_phi).unsqueeze(-1)
         ], dim=-1)
 
-        # 2. Vector Rotation
+        # Vector Rotation
         beta_j = orientation[src].squeeze(-1)
         rot_angle = (beta_j - alpha_i) * self.spin_symmetry
 
@@ -86,7 +82,7 @@ class SparseLocalFrameLayer(nn.Module):
 
         v_j_rot = torch.stack([v_j_rot_x, v_j_rot_y], dim=-1).view(-1, self.vector_dim)
 
-        # 3. Message Passing
+        # Message Passing
         msg_input = torch.cat([h_s[src], h_s[dst], v_j_rot, geo_feat], dim=-1)
         raw_msg = self.message_mlp(msg_input)
 
@@ -137,32 +133,29 @@ class GalaxyLSSBackbone(nn.Module):
 
 class GalaxyLSSWrapper(nn.Module):
     """
-    Acts as the 'CompressionNetwork'.
-    Converts equivariant vector features into angles before passing to VMDN.
+    Compression network using arctan2 to convert equivariant vectors to angles.
     """
 
     def __init__(self, backbone: GalaxyLSSBackbone):
         super().__init__()
         self.backbone = backbone
 
-        # Output size: Scalar Channels + (Vector Channels / 2)
-        # We divide vector channels by 2 because (x, y) pairs become 1 angle.
-        self.out_size = backbone.s_dim + (backbone.v_dim // 2)
+        # Scalar channels + 1 Angle channel per vector pair
+        num_vectors = backbone.v_dim // 2
+        self.out_size = backbone.s_dim + num_vectors
 
     def forward(self, pos, redshift, input_shapes, edge_index=None):
         h_s, h_v = self.backbone(pos, redshift, input_shapes, edge_index)
 
-        # 1. Reshape Vector Features to Pairs
-        # h_v shape: [N, v_dim] -> [N, num_vectors, 2]
+        # Reshape to Pairs [N, Pairs, 2]
         num_vectors = self.backbone.v_dim // 2
         v_vectors = h_v.view(-1, num_vectors, 2)
 
-        # 2. Convert to Angles (Logic from your CompressionNetwork)
-        # arctan2(y, x) -> recovers the spin-2 angle
+        # Convert to Angles [N, Pairs]
+        # This angle represents 2*theta because of the spin-2 symmetry in the layers
         v_angles = torch.atan2(v_vectors[:, :, 1], v_vectors[:, :, 0] + 1e-5)
 
-        # 3. Fuse with Scalars
-        # We keep the scalars (redshift info) and concatenate the angles
+        # Fuse [N, s_dim + num_vectors]
         features = torch.cat([h_s, v_angles], dim=-1)
 
         return features
