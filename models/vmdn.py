@@ -40,13 +40,13 @@ class VMDN(nn.Module):
         mu = torch.atan2(mean_xy[..., 1], mean_xy[..., 0])
 
         log_kappa = self.kappa_network(compressed)
-        log_kappa = torch.clamp(log_kappa, min=-6.91, max=-0.5)
+        log_kappa = torch.clamp(log_kappa, min=-10, max=-5)
         kappa = torch.exp(log_kappa)
         return mu, kappa
 
     def loss(self, pos, z, shapes, target, edge_index=None, mask=None):
         """
-        Full-batch loss with stochastic masking.
+        Full-batch loss with stochastic masking + Soft Kappa Regularization.
         target: Should be 2*phi (Spin-1 domain).
         """
         mu, kappa = self.forward(pos, z, shapes, edge_index)
@@ -60,15 +60,22 @@ class VMDN(nn.Module):
         dist_vonmises = VonMises(mu, kappa)
         log_prob = dist_vonmises.log_prob(target)
 
-        # Apply Stochastic Mask (Subsampling)
+        # --- APPLY MASKS ---
         if mask is not None:
             log_prob = log_prob[mask]
+            active_kappa = kappa[mask]  # Only penalize kappa for nodes we are training on
+        else:
+            active_kappa = kappa
 
+        # 1. Main Task Loss (Negative Log Likelihood)
         nll = -log_prob.mean()
 
-        # Optional Regularization (disabled by default)
-        if self.training and self.lambda_kappa > 0 and mask is not None:
-            # Pairwise regularization logic here if needed
-            pass
+        # 2. Soft Kappa Regularization (The "Entropy Penalty")
+        # This replaces the hard clamping.
+        # It adds a cost for being "too confident" (high kappa).
+        kappa_penalty = self.lambda_kappa * active_kappa.mean()
 
-        return nll
+        # Total Loss
+        total_loss = nll + kappa_penalty
+
+        return total_loss
