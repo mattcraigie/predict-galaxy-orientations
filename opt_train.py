@@ -482,9 +482,15 @@ if __name__ == "__main__":
 
     # Define Search Space
     space = {
-        'lr': hp.loguniform('lr', np.log(1e-5), np.log(1e-3)),
-        'subsample_ratio': hp.loguniform('subsample_ratio', np.log(0.001), np.log(0.5)),
-        'hidden_dim': hp.choice('hidden_dim', [32, 64, 128, 256, 512])
+        # Narrowing focus to the "safe" low-LR region that worked best
+        'lr': hp.loguniform('lr', np.log(1e-5), np.log(1.5e-4)),
+
+        # SWITCH to uniform. We want to explore the stable, large-batch regime (10% to 60% of data)
+        'subsample_ratio': hp.uniform('subsample_ratio', 0.1, 0.5),
+
+        # Granular search around the winner (64).
+        # We drop 256/512 entirely. Added 48 and 96 for fine-tuning.
+        'hidden_dim': hp.choice('hidden_dim', [32, 48, 64, 96, 128])
     }
 
     # Initialize Trials object to store results
@@ -522,4 +528,4 @@ if __name__ == "__main__":
     print(df_res)
 
     # Optional: Save results to CSV for plotting later
-    df_res.to_csv("hpo_results.csv", index=False)
+    df_res.to_csv("hpo_results_fine.csv", index=False)
