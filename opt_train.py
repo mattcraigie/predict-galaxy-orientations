@@ -19,6 +19,23 @@ from models.vmdn import init_vmdn
 from models.galaxy_gnn import GraphBuilder
 from models.pretraining import GalaxyReconstructor
 
+
+# Default config
+DEFAULT_CONFIG = {
+    "csv_path": "data/des_metacal_angles_minimal.csv",
+    "lr": 2e-3,
+    "epochs": 1000,
+    "patience": 30,
+    "num_neighbors": 20,
+    "hidden_dim": 64,
+    "subsample_ratio": 0.25,
+    "device": "auto",
+    "log_dir": "runs",
+    "run_name": "com_test",
+    "inject_signal": True  # Enabled for this test
+}
+
+
 def load_config(config_path: Path) -> dict:
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle) or {}
