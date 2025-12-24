@@ -475,14 +475,14 @@ if __name__ == "__main__":
     # Load Defaults
     GLOBAL_CONFIG = load_config(args.config)
     # Decrease epochs for HPO trials to speed things up?
-    GLOBAL_CONFIG['epochs'] = 200
+    GLOBAL_CONFIG['epochs'] = 1000
 
     # Load Data Once
     GLOBAL_DATA = load_data_global(GLOBAL_CONFIG)
 
     # Define Search Space
     space = {
-        'lr': hp.loguniform('lr', np.log(1e-4), np.log(1e-2)),
+        'lr': hp.loguniform('lr', np.log(1e-5), np.log(1e-3)),
         'subsample_ratio': hp.loguniform('subsample_ratio', np.log(0.001), np.log(0.5)),
         'hidden_dim': hp.choice('hidden_dim', [32, 64, 128, 256, 512])
     }
@@ -496,7 +496,7 @@ if __name__ == "__main__":
         fn=objective,
         space=space,
         algo=tpe.suggest,  # Tree-structured Parzen Estimator
-        max_evals=5,  # Number of trials
+        max_evals=20,  # Number of trials
         trials=trials
     )
 
