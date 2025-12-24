@@ -19,13 +19,274 @@ from models.vmdn import init_vmdn
 from models.galaxy_gnn import GraphBuilder
 from models.pretraining import GalaxyReconstructor
 
+def load_config(config_path: Path) -> dict:
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+    merged = {**DEFAULT_CONFIG, **config}
+    if merged["device"] == "auto":
+        merged["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+    repo_root = Path(__file__).resolve().parent
+    for path_key in ("csv_path", "log_dir"):
+        path_value = Path(merged[path_key])
+        if not path_value.is_absolute():
+            merged[path_key] = str((repo_root / path_value).resolve())
+    return merged
 
-# --- KEEP YOUR HELPER FUNCTIONS ---
-# (Paste your existing circular_mae, create_density_figure,
-# CDFNormalizer, inject_com_signal, load_config here...)
-# ----------------------------------
 
-# [Past helper functions omitted for brevity - assume they exist as in your script]
+# --- METRICS & PLOTTING ---
+def circular_mae(true, pred):
+    # Normalize to [0, 2pi]
+    true = torch.remainder(true, 2 * np.pi)
+    pred = torch.remainder(pred, 2 * np.pi)
+    diff = torch.abs(true - pred)
+    dist = torch.min(diff, 2 * np.pi - diff)
+    return dist.mean().item()
+
+
+def create_density_figure(true, pred, title, normalizer=None):
+    true = np.remainder(true, 2 * np.pi)
+    pred = np.remainder(pred, 2 * np.pi)
+    bins = 64
+    H, _, _ = np.histogram2d(true, pred, bins=bins, range=[[0, 2 * np.pi], [0, 2 * np.pi]])
+    row_sums = H.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    H_norm = H / row_sums
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = ax.imshow(H_norm.T, origin='lower', extent=[0, 2 * np.pi, 0, 2 * np.pi], aspect='auto', cmap='viridis', vmin=0,
+                   vmax=np.max(H_norm) * 0.8)
+    label_suffix = " (Warped)" if normalizer else ""
+    ax.set_title(title + label_suffix)
+    ax.set_xlabel(f'True Angle{label_suffix}')
+    ax.set_ylabel(f'Pred Angle{label_suffix}')
+    ax.plot([0, 2 * np.pi], [0, 2 * np.pi], 'r--', alpha=0.5)
+    plt.colorbar(im, ax=ax)
+    return fig
+
+
+# --- CDF NORMALIZER ---
+class CDFNormalizer:
+    """
+    Learns the global distribution P(phi) and warps the space
+    so that the global distribution becomes Uniform(0, 2pi).
+
+    This forces the model to learn purely LOCAL deviations (intrinsic alignment)
+    rather than global systematics (grid locking).
+    """
+
+    def __init__(self):
+        self.cdf_func = None
+        self.inv_cdf_func = None
+
+    def fit(self, angles):
+        """
+        Compute empirical CDF from training data.
+        angles: numpy array of angles in [0, 2pi]
+        """
+        # Sort data to get the empirical distribution
+        sorted_angles = np.sort(angles)
+        n = len(sorted_angles)
+
+        # y-values for CDF (0 to 1)
+        y_vals = np.arange(n) / (n - 1)
+
+        # Create interpolation function F(x) -> u
+        # We pad with 0 and 2pi to handle edge cases
+        x_pad = np.concatenate([[0.0], sorted_angles, [2 * np.pi]])
+        y_pad = np.concatenate([[0.0], y_vals, [1.0]])
+
+        self.cdf_func = interp1d(x_pad, y_pad, kind='linear', bounds_error=False, fill_value=(0, 1))
+
+        # Inverse for plotting later (optional)
+        self.inv_cdf_func = interp1d(y_pad, x_pad, kind='linear', bounds_error=False, fill_value="extrapolate")
+        print(" Global CDF fitted. Systematic biases capture initiated.")
+
+    def transform(self, angles):
+        """ Warps angles to be Uniform [0, 2pi] """
+        if self.cdf_func is None:
+            raise ValueError("Run fit() first!")
+
+        # 1. Map to [0, 1] using CDF
+        u = self.cdf_func(angles)
+
+        # 2. Map to [0, 2pi]
+        return (u * 2 * np.pi).astype(np.float32)
+
+
+# --- NEW SIGNAL INJECTION: CENTER OF MASS ---
+def inject_com_signal(pos, edge_index, N, device):
+    """
+    1. Assigns RANDOM input shapes (model must ignore them).
+    2. Calculates the geometric Center of Mass (CoM) of neighbors.
+    3. Sets Target = Angle pointing towards that CoM.
+    """
+    print("!!! INJECTING SIGNAL: POINT TO NEIGHBOR CENTER OF MASS !!!")
+
+    # 1. Random Inputs
+    # The model must learn that 'input_shapes' are useless noise
+    # and look at the graph structure/geometry instead.
+    rand_angles = torch.rand(N, device=device) * 2 * np.pi
+    input_e1 = torch.cos(rand_angles)
+    input_e2 = torch.sin(rand_angles)
+    inputs = torch.stack([input_e1, input_e2], dim=1).float()
+
+    # 2. Calculate CoM of Neighbors
+    src, dst = edge_index
+
+    # Sum neighbor positions grouped by center node (dst)
+    sum_pos = torch.zeros((N, 2), device=device)
+    sum_pos.index_add_(0, dst, pos[src])
+
+    # Count neighbors per node
+    ones = torch.ones(src.shape[0], device=device)
+    counts = torch.zeros(N, device=device)
+    counts.index_add_(0, dst, ones)
+    counts = counts.clamp(min=1.0).unsqueeze(-1)
+
+    com = sum_pos / counts
+
+    # 3. Vector from Self to CoM
+    vec_to_com = com - pos
+
+    # 4. Target Angle
+    # Calculate physical angle theta of the vector
+    theta = torch.atan2(vec_to_com[:, 1], vec_to_com[:, 0])
+
+    # Convert to "Double Angle" (Spin-2 domain) target
+    # If the galaxy "points" along the vector, its orientation phi = theta
+    # Our model predicts 2*phi, so we target 2*theta.
+    target_angles = torch.remainder(2 * theta, 2 * np.pi)
+
+    return inputs, target_angles
+
+
+def load_full_data(config):
+    print(f"Loading full catalog from {config['csv_path']}...")
+    df = pd.read_csv(config['csv_path'])
+    df = df.dropna(subset=['ra', 'dec', 'mean_z', 'phi_deg'])
+
+    # strict radius filter
+    ra, dec = df['ra'].values, df['dec'].values
+    tree = cKDTree(np.stack([ra, dec], axis=1))
+    dist, _ = tree.query(np.stack([ra, dec], axis=1), k=2)
+    valid_mask = dist[:, 1] > 0.0005
+    df = df[valid_mask]
+
+    ra = df['ra'].values.astype(np.float32)
+    dec = df['dec'].values.astype(np.float32)
+    pos = np.stack([ra, dec], axis=1)
+    pos_min, pos_max = pos.min(axis=0), pos.max(axis=0)
+    pos = (pos - pos_min) / (pos_max - pos_min) * 2 - 1
+
+    z = df['mean_z'].values.astype(np.float32)
+    device = config['device']
+
+    # 1. Build Graph
+    print(f"Building graph (k={config['num_neighbors']})...")
+    t_pos = torch.tensor(pos, device=device)
+    edge_index = GraphBuilder.build_edges(t_pos, k=config['num_neighbors'])
+
+    # 2. Inject Signal OR Load Real Data
+    if config.get('inject_signal', False):
+        # We pass t_pos and edge_index because the target depends on geometry now
+        t_shapes, t_target = inject_com_signal(t_pos, edge_index, len(pos), device)
+        normalizer = None
+    else:
+        phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
+        raw_targets = 2.0 * phi_rad
+
+        normalizer = CDFNormalizer()
+        normalizer.fit(raw_targets)
+        target_angles = normalizer.transform(raw_targets)
+
+        e1 = np.cos(target_angles)
+        e2 = np.sin(target_angles)
+        t_shapes = torch.stack([torch.tensor(e1), torch.tensor(e2)], dim=1).to(device).float()
+        t_target = torch.tensor(target_angles, device=device).float()
+
+    t_z = torch.tensor(z[:, None], device=device)
+
+    return t_pos, t_z, t_shapes, t_target, edge_index, normalizer
+
+
+# --- DETERMINISTIC INFERENCE ---
+def generate_full_catalog_predictions(model, pos, z, shapes, edge_index, num_passes=4):
+    print(f"\n--- Generating Full Catalog Predictions ({num_passes}-Pass Strategy) ---")
+    model.eval()
+    N = pos.shape[0]
+    all_mu = torch.zeros(N, device=pos.device)
+    all_kappa = torch.zeros(N, device=pos.device)
+
+    with torch.no_grad():
+        for i in range(num_passes):
+            mask_indices = torch.arange(i, N, num_passes, device=pos.device)
+            masked_shapes = shapes.clone()
+            masked_shapes[mask_indices] = 0.0  # Blind spot
+
+            mu, kappa = model(pos, z, masked_shapes, edge_index)
+
+            all_mu[mask_indices] = mu[mask_indices].squeeze()
+            all_kappa[mask_indices] = kappa[mask_indices].squeeze()
+
+    return all_mu, all_kappa
+
+
+def run_pretraining(config, pos, z, shapes, edge_index):
+    print("\n=== STARTING PRE-TRAINING (Latent Truncation Strategy) ===")
+
+    pre_model = GalaxyReconstructor(config).to(config['device'])
+    optimizer = torch.optim.Adam(pre_model.parameters(), lr=1e-3)  # Lower LR for stability
+
+    # --- STABILITY FIX: Normalize Targets ---
+    # We want z to be roughly mean 0, std 1 so MSE doesn't explode
+    z_mean = z.mean()
+    z_std = z.std() + 1e-6
+    z_norm = (z - z_mean) / z_std
+    # ----------------------------------------
+
+    pre_model.train()
+    epochs = config.get('pretrain_epochs', 50)
+
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+
+        # Mask 25% of nodes
+        N = pos.shape[0]
+        batch_size = int(N * 0.25)
+        mask_idx = torch.randperm(N)[:batch_size]
+
+        # Create Inputs (Masked)
+        masked_shapes = shapes.clone()
+        masked_z = z_norm.clone()
+
+        # Zero out info for masked nodes
+        masked_shapes[mask_idx] = 0.0
+        masked_z[mask_idx] = 0.0
+
+        # Boolean Mask
+        mask = torch.zeros(N, dtype=torch.bool, device=config['device'])
+        mask[mask_idx] = True
+
+        # Pass NORMALIZED z as target, but masked z as input
+        loss = pre_model.loss(pos, masked_z, masked_shapes, edge_index, mask)
+
+        if torch.isnan(loss):
+            print("!!! LOSS BECAME NAN !!! Stopping pre-training.")
+            break
+
+        loss.backward()
+
+        # Gradient Clipping (Safety net for explosions)
+        torch.nn.utils.clip_grad_norm_(pre_model.parameters(), 1.0)
+
+        optimizer.step()
+
+        if epoch % 10 == 0:
+            print(f"  [Pretrain Epoch {epoch}] Loss: {loss.item():.6f}")
+
+    print("=== PRE-TRAINING COMPLETE ===\n")
+    torch.save(pre_model.backbone.state_dict(), "pretrained_backbone.pth")
+    return "pretrained_backbone.pth"
+
 
 # --- 1. SEPARATE DATA LOADING ---
 # We load data ONCE globally to save massive amounts of time
