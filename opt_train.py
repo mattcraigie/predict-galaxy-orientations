@@ -197,7 +197,7 @@ if __name__ == "__main__":
     # Load Defaults
     GLOBAL_CONFIG = load_config(args.config)
     # Decrease epochs for HPO trials to speed things up?
-    GLOBAL_CONFIG['epochs'] = 1000
+    GLOBAL_CONFIG['epochs'] = 500
 
     # Load Data Once
     GLOBAL_DATA = load_data_global(GLOBAL_CONFIG)
@@ -218,7 +218,7 @@ if __name__ == "__main__":
         fn=objective,
         space=space,
         algo=tpe.suggest,  # Tree-structured Parzen Estimator
-        max_evals=50,  # Number of trials
+        max_evals=20,  # Number of trials
         trials=trials
     )
 
