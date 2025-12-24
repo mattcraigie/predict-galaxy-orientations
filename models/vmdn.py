@@ -40,7 +40,7 @@ class VMDN(nn.Module):
         mu = torch.atan2(mean_xy[..., 1], mean_xy[..., 0])
 
         log_kappa = self.kappa_network(compressed)
-        log_kappa = torch.clamp(log_kappa, min=-6.91, max=-4.61)
+        log_kappa = torch.clamp(log_kappa, min=-6.91, max=-0.5)
         kappa = torch.exp(log_kappa)
         return mu, kappa
 
