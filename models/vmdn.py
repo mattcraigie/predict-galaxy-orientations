@@ -118,8 +118,10 @@ class VMDN(nn.Module):
         if mask is not None:
             log_prob = log_prob[mask]
             active_kappa = kappa[mask]
+            active_mu = mu[mask]
         else:
             active_kappa = kappa
+            active_mu = mu
 
         # 1. Negative log-likelihood
         nll = -log_prob.mean()
