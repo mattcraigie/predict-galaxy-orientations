@@ -27,7 +27,7 @@ def init_vmdn(model_config):
         wrapper,
         hidden_layers=[vmdn_dim, vmdn_dim],
         lambda_kappa=lambda_kappa,
-        iso_weight=iso_weight
+        # iso_weight=iso_weight
     )
 
 
