@@ -51,7 +51,7 @@ class VMDN(nn.Module):
             iso_weight=0.0
     ):
         super().__init__()
-
+        print("iso weight: ", iso_weight)
         self.compression_network = compression_network
         self.lambda_kappa = lambda_kappa
         self.iso_weight = iso_weight
@@ -132,6 +132,8 @@ class VMDN(nn.Module):
         # 3. Anisotropy penalty
         batch_cos = torch.mean(torch.cos(active_mu))
         batch_sin = torch.mean(torch.sin(active_mu))
+        if np.random.random() < 0.001:
+            print((batch_cos ** 2 + batch_sin ** 2))
         iso_penalty = self.iso_weight * (batch_cos ** 2 + batch_sin ** 2)
 
         # Total loss
