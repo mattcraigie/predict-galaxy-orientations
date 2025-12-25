@@ -1,11 +1,11 @@
 csv_path: data/des_metacal_angles_minimal.csv
 batch_size: 256
 lr: 0.001
-epochs: 100
+epochs: 1000
 patience: 10
 num_workers: 4
-log_dir: runs/galaxy_vmdn_experiment_real_data
-num_neighbors: 5
+log_dir: runs/default
+num_neighbors: 10
 gnn_hidden_dim: 64
 num_layers: 3
 vmdn_kappa_weight: 0.1
