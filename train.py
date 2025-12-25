@@ -207,9 +207,9 @@ def load_full_data(config):
         phi_rad = np.deg2rad(df['phi_deg'].values.astype(np.float32))
         raw_targets = 2.0 * phi_rad
 
-        normalizer = CDFNormalizer()
-        normalizer.fit(raw_targets)
-        target_angles = normalizer.transform(raw_targets)
+        normalizer = None # CDFNormalizer()
+        # normalizer.fit(raw_targets)
+        target_angles = raw_targets # normalizer.transform(raw_targets)
 
         e1 = np.cos(target_angles)
         e2 = np.sin(target_angles)
