@@ -36,6 +36,10 @@ import torch.nn as nn
 from torch.distributions import VonMises
 
 
+import torch
+import torch.nn as nn
+from torch.distributions import VonMises
+
 class VMDN(nn.Module):
     """
     Von Mises Density Network.
@@ -48,13 +52,18 @@ class VMDN(nn.Module):
             compression_network,
             hidden_layers=(32, 32),
             lambda_kappa=0.0,
-            iso_weight=0.0
+            iso_weight=0.0,
+            iso_K=6,
+            iso_w_decay=2.0,   # w_k = 1 / k^iso_w_decay (set 0.0 for uniform weights)
     ):
         super().__init__()
-        print("iso weight: ", iso_weight)
         self.compression_network = compression_network
         self.lambda_kappa = lambda_kappa
         self.iso_weight = iso_weight
+
+        # Fourier isotropy config
+        self.iso_K = int(iso_K)
+        self.iso_w_decay = float(iso_w_decay)
 
         # Angle network outputs (x, y) to preserve angular continuity
         self.angle_network = MLP(
@@ -85,6 +94,30 @@ class VMDN(nn.Module):
         kappa = torch.exp(log_kappa)
 
         return mu, kappa
+
+    def _fourier_isotropy_penalty(self, angles: torch.Tensor) -> torch.Tensor:
+        """
+        Multi-harmonic circular moment penalty:
+          sum_{k=1..K} w_k * (mean cos(k*theta))^2 + (mean sin(k*theta))^2
+        angles: (B,)
+        """
+        if self.iso_weight <= 0.0 or self.iso_K <= 0:
+            return angles.new_tensor(0.0)
+
+        # Build k = 1..K on the right device/dtype
+        k = torch.arange(1, self.iso_K + 1, device=angles.device, dtype=angles.dtype)  # (K,)
+        a = angles.unsqueeze(0) * k.unsqueeze(1)  # (K, B)
+
+        c = torch.cos(a).mean(dim=1)  # (K,)
+        s = torch.sin(a).mean(dim=1)  # (K,)
+        power = c.square() + s.square()  # (K,)
+
+        if self.iso_w_decay == 0.0:
+            w = torch.ones_like(power)
+        else:
+            w = 1.0 / (k ** self.iso_w_decay)  # (K,)
+
+        return self.iso_weight * torch.sum(w * power)
 
     def loss(
             self,
@@ -129,14 +162,10 @@ class VMDN(nn.Module):
         # 2. Soft kappa regularization (entropy penalty)
         kappa_penalty = self.lambda_kappa * active_kappa.mean()
 
-        # 3. Anisotropy penalty
-        batch_cos = torch.mean(torch.cos(active_mu))
-        batch_sin = torch.mean(torch.sin(active_mu))
-        if np.random.random() < 0.001:
-            print((batch_cos ** 2 + batch_sin ** 2))
-        iso_penalty = self.iso_weight * (batch_cos ** 2 + batch_sin ** 2)
+        # 3. Fourier isotropy penalty (replaces old 1st-moment anisotropy term)
+        iso_penalty = self._fourier_isotropy_penalty(active_mu)
 
         # Total loss
         total_loss = nll + kappa_penalty + iso_penalty
-
         return total_loss
+
