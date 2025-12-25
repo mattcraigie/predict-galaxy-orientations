@@ -27,7 +27,7 @@ def init_vmdn(model_config):
         wrapper,
         hidden_layers=[vmdn_dim, vmdn_dim],
         lambda_kappa=lambda_kappa,
-        # iso_weight=iso_weight
+        iso_weight=iso_weight
     )
 
 
@@ -48,13 +48,13 @@ class VMDN(nn.Module):
             compression_network,
             hidden_layers=(32, 32),
             lambda_kappa=0.0,
-            dropout=0.0,
+            iso_weight=0.0
     ):
         super().__init__()
 
         self.compression_network = compression_network
         self.lambda_kappa = lambda_kappa
-        self.dropout = dropout
+        self.iso_weight = iso_weight
 
         # Angle network outputs (x, y) to preserve angular continuity
         self.angle_network = MLP(
@@ -127,7 +127,12 @@ class VMDN(nn.Module):
         # 2. Soft kappa regularization (entropy penalty)
         kappa_penalty = self.lambda_kappa * active_kappa.mean()
 
+        # 3. Anisotropy penalty
+        batch_cos = torch.mean(torch.cos(active_mu))
+        batch_sin = torch.mean(torch.sin(active_mu))
+        iso_penalty = self.iso_weight * (batch_cos ** 2 + batch_sin ** 2)
+
         # Total loss
-        total_loss = nll + kappa_penalty
+        total_loss = nll + kappa_penalty + iso_penalty
 
         return total_loss
