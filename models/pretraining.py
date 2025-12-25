@@ -13,7 +13,7 @@ class GalaxyReconstructor(nn.Module):
         super().__init__()
         # Use exact same backbone configuration as main model
         self.backbone = GalaxyLSSBackbone(
-            hidden_dim=config['hidden_dim'],
+            hidden_dim=config['gnn_hidden_dim'],
             num_layers=config.get('num_layers', 3),
             input_scalar_dim=1,
             input_vector_dim=2

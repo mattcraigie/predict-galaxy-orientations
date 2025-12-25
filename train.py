@@ -21,14 +21,16 @@ DEFAULT_CONFIG = {
     "epochs": 1000,
     "patience": 30,
     "num_neighbors": 20,
-    "hidden_dim": 64,
+    "gnn_hidden_dim": 64,
+    "vmdn_hidden_dim": 64,
     "subsample_ratio": 0.25,
     "device": "auto",
     "log_dir": "runs",
     "run_name": "com_test",
-    "inject_signal": True  # Enabled for this test
+    "inject_signal": True,  # Enabled for this test
+    "vmdn_kappa_weight": 1e-1,
+    "vmdn_isotropy_weight": 1.0,
 }
-
 
 def load_config(config_path: Path) -> dict:
     with config_path.open("r", encoding="utf-8") as handle:
